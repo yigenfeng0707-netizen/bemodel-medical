@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.env
+.env.*
+.chrome-clone/
+.edge-profile/
+.DS_Store
+Thumbs.db
