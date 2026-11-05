@@ -148,6 +148,12 @@ async function selectTicket(t) {
   catch { /* */ }
   finally { diagnosing.value = false; }
 }
+async function diagnose() {
+  diagnosing.value = true;
+  try { diagnosis.value = await ticketDiagnosis(curTicket.value.id); }
+  catch { /* */ }
+  finally { diagnosing.value = false; }
+}
 async function refund() {
   await ElMessageBox.confirm('生成退费申请并办结工单？', '一键处置');
   const r = await refundTicket(curTicket.value.id);
