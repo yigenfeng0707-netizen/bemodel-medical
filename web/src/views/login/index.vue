@@ -18,7 +18,7 @@
         <el-button type="primary" style="width:100%" :loading="loading" @click="doLogin">登 录</el-button>
       </el-form>
       <div class="demo-accounts">
-        演示账号：admin/admin123（管理员）· modeler/model123（建模员）· reviewer/reviewer123（评审员）· viewer/viewer123（只读）
+        演示账号与角色权限见项目 README「演示账号」表（评审材料同）。
       </div>
     </el-card>
   </div>
@@ -34,8 +34,8 @@ import { useUserStore } from '../../store/user';
 const router = useRouter();
 const route = useRoute();
 const userStore = useUserStore();
-const username = ref('admin');
-const password = ref('admin123');
+const username = ref('');
+const password = ref('');
 const loading = ref(false);
 
 async function doLogin() {

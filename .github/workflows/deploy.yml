@@ -47,6 +47,7 @@ jobs:
           npm ci
           npm run build
           grep -q "X-Token" dist/assets/*.js || { echo "::error::dist missing X-Token interceptor"; exit 1; }
+          if grep -q "admin123" dist/assets/*.js; then echo "::error::dist leaks demo password"; exit 1; fi
 
       - name: Clone studio repo
         run: |
