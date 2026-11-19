@@ -1,7 +1,6 @@
 // 知识双轨集成测试（隔离 DATA_DIR；禁用 LLM/向量路；文档摄取/生命周期/防自审/条目审批/FTS5 检索）
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 
@@ -11,14 +10,12 @@ process.env.EMBEDDING_BASE_URL = ''; // 关向量路，FTS5 关键词路 + 诚�
 process.env.EMBEDDING_TIMEOUT_MS = '1'; // 配置层对空串回退默认 localhost:11434，1ms 超时保证测试不外呼等待
 
 const dir = path.resolve('data-test', 'knowledge');
-fs.rmSync(dir, { recursive: true, force: true });
-fs.mkdirSync(dir, { recursive: true });
 process.env.DATA_DIR = dir;
 
-let app, server, adminToken, platform;
+let app, server, adminToken, platform, ensureDatabases;
 
 before(async () => {
-  ({ platform } = await import('../src/db.js'));
+  ({ platform, ensureDatabases } = await import('../src/db.js'));
   const { seedDemoDbs } = await import('../src/seed/demo.js');
   const { seedPlatformData } = await import('../src/seed/platform.js');
   const mod = await import('../src/knowledge.js');
@@ -26,10 +23,13 @@ before(async () => {
   Object.assign(globalThis, { knowledgeSearch, parseDoc, entryContent, basisEntries });
   const { requireAuth, authorize, issueToken, seedUsers } = await import('../src/auth.js');
 
-  assert.equal(seedDemoDbs(true), true);
-  seedPlatformData();
-  seedUsers();
-  adminToken = issueToken(platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get());
+  await ensureDatabases();
+  await platform.initSchema();
+  assert.equal(await seedDemoDbs(true), true);
+  await seedPlatformData(true);
+  await seedUsers();
+  const admin = await platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get();
+  adminToken = issueToken(admin);
 
   app = express();
   app.use(express.json());
@@ -140,23 +140,23 @@ test('知识条目: 创建去重 + 改发布条目自动回 REVIEW + 发布递�
   // DRAFT→REVIEW→PUBLISHED（version+1）
   await call('POST', `/api/knowledge/entries/${e.id}/transition`, { target: 'REVIEW' });
   await call('POST', `/api/knowledge/entries/${e.id}/transition`, { target: 'PUBLISHED' });
-  assert.equal(entryContent('KB-TEST-01'), '口径说明');
+  assert.equal(await entryContent('KB-TEST-01'), '口径说明');
   // 编辑已发布 → 自动回 REVIEW，读取口不再返回
   await call('PUT', `/api/knowledge/entries/${e.id}`, { content: '口径说明修订' });
-  assert.equal(entryContent('KB-TEST-01'), null, '改一条走审批');
-  const e2 = platform.prepare('SELECT * FROM bm_knowledge WHERE code=?').get('KB-TEST-01');
+  assert.equal(await entryContent('KB-TEST-01'), null, '改一条走审批');
+  const e2 = await platform.prepare('SELECT * FROM bm_knowledge WHERE code=?').get('KB-TEST-01');
   assert.equal(e2.status, 'REVIEW');
   assert.equal(Number(e2.version), 2, '发布时 version 递增到 2');
 });
 
 test('basisEntries: applies_to CSV 命中概念，仅 PUBLISHED 参与读取', async () => {
   // KB-TEST-01 处于 REVIEW → 不参与
-  let rows = basisEntries('LAB_APPLY');
+  let rows = await basisEntries('LAB_APPLY');
   assert.ok(rows.every(r => r.code !== 'KB-TEST-01'), '非 PUBLISHED 不进依据读取口');
   // 重新过审发布 → 参与且为修订内容
-  const e = platform.prepare("SELECT id FROM bm_knowledge WHERE code='KB-TEST-01'").get();
+  const e = await platform.prepare("SELECT id FROM bm_knowledge WHERE code='KB-TEST-01'").get();
   await call('POST', `/api/knowledge/entries/${e.id}/transition`, { target: 'PUBLISHED' });
-  rows = basisEntries('LAB_APPLY');
+  rows = await basisEntries('LAB_APPLY');
   const hit = rows.find(r => r.code === 'KB-TEST-01');
   assert.ok(hit, '发布后进入读取口');
   assert.equal(hit.content, '口径说明修订');

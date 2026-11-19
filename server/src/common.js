@@ -79,7 +79,7 @@ export function decryptSecret(stored) {
 }
 
 // ---------- SqlGuard：管理端可信探针 SQL 的只读守卫 ----------
-const GUARD_FORBIDDEN = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE', 'TRUNCATE', 'GRANT', 'REVOKE', 'REPLACE', 'MERGE', 'CALL', 'SET', 'LOCK', 'UNLOCK', 'RENAME', 'KILL', 'SHUTDOWN', 'ATTACH', 'DETACH', 'PRAGMA'];
+const GUARD_FORBIDDEN = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE', 'TRUNCATE', 'GRANT', 'REVOKE', 'REPLACE', 'MERGE', 'CALL', 'SET', 'LOCK', 'UNLOCK', 'RENAME', 'KILL', 'SHUTDOWN', 'COPY', 'VACUUM'];
 export function stripComments(sql) {
   return String(sql || '')
     .replace(/--[^\n]*/g, ' ')
@@ -108,7 +108,7 @@ export function clampLimit(sql, maxRows) {
 }
 
 // ---------- LLM 生成 SQL 的白名单校验（表/列白名单沙箱） ----------
-const SQL_KEYWORDS = new Set(('SELECT FROM WHERE GROUP BY ORDER HAVING LIMIT OFFSET AS ON AND OR NOT NULL IS IN LIKE BETWEEN EXISTS CASE WHEN THEN ELSE END JOIN LEFT RIGHT INNER OUTER CROSS UNION ALL DISTINCT COUNT SUM AVG MIN MAX COALESCE IFNULL ROUND CAST STRFTIME DATE DATETIME JULIANDAY TOTAL UPPER LOWER LENGTH SUBSTR TRIM ABS INTEGER TEXT REAL DESC ASC VALUES WITH %.').split(/\s+/));
+const SQL_KEYWORDS = new Set(('SELECT FROM WHERE GROUP BY ORDER HAVING LIMIT OFFSET AS ON AND OR NOT NULL IS IN LIKE BETWEEN EXISTS CASE WHEN THEN ELSE END JOIN LEFT RIGHT INNER OUTER CROSS UNION ALL DISTINCT COUNT SUM AVG MIN MAX COALESCE ROUND CAST TO_CHAR EXTRACT CURRENT_DATE CURRENT_TIMESTAMP UPPER LOWER LENGTH SUBSTR TRIM ABS INTEGER TEXT REAL DESC ASC VALUES WITH %.').split(/\s+/));
 export function validateSql(rawSql, allowedTables, allowedColumns) {
   // 原文（保留字面量，仅去注释）——最终执行与返回的都是它
   let orig = String(rawSql || '')
@@ -122,7 +122,7 @@ export function validateSql(rawSql, allowedTables, allowedColumns) {
   if (orig.includes(';')) throw new BizException('SQL 校验失败：禁止多语句');
   if (!/^SELECT\b/i.test(orig)) throw new BizException('SQL 校验失败：仅允许 SELECT 查询');
   const upper = ' ' + chk.toUpperCase() + ' ';
-  for (const kw of ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'TRUNCATE', 'CREATE', 'GRANT', 'REVOKE', 'REPLACE', 'LOAD', 'CALL', 'EXEC', 'EXECUTE', 'HANDLER', 'LOCK', 'UNLOCK', 'SET', 'INTO', 'OUTFILE', 'ATTACH', 'DETACH', 'PRAGMA']) {
+  for (const kw of ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'TRUNCATE', 'CREATE', 'GRANT', 'REVOKE', 'REPLACE', 'LOAD', 'CALL', 'EXEC', 'EXECUTE', 'HANDLER', 'LOCK', 'UNLOCK', 'SET', 'INTO', 'OUTFILE', 'COPY', 'VACUUM']) {
     if (new RegExp(`\\b${kw}\\b`).test(upper)) throw new BizException(`SQL 校验失败：含被禁止的关键字 ${kw}`);
   }
   // 表白名单：FROM/JOIN 后的表名

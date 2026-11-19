@@ -1,7 +1,6 @@
 // 认证与权限矩阵测试（JWT 签发/篡改/过期 + login/me + authorize 角色矩阵）
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 
@@ -10,24 +9,25 @@ process.env.LLM_BACKUP_API_KEY = '';
 process.env.EMBEDDING_TIMEOUT_MS = '1';
 
 const dir = path.resolve('data-test', 'auth');
-fs.rmSync(dir, { recursive: true, force: true });
-fs.mkdirSync(dir, { recursive: true });
 process.env.DATA_DIR = dir;
 
-let app, server, platform, auth;
+let app, server, platform, auth, ensureDatabases;
 const tokens = {};
 
 before(async () => {
-  ({ platform } = await import('../src/db.js'));
+  ({ platform, ensureDatabases } = await import('../src/db.js'));
   const { seedDemoDbs } = await import('../src/seed/demo.js');
   const { seedPlatformData } = await import('../src/seed/platform.js');
   auth = await import('../src/auth.js');
   const { seedUsers } = auth;
 
-  assert.equal(seedDemoDbs(true), true);
-  seedPlatformData();
-  seedUsers();
-  for (const u of platform.prepare('SELECT * FROM bm_user').all()) tokens[u.role] = auth.issueToken(u);
+  await ensureDatabases();
+  await platform.initSchema();
+
+  assert.equal(await seedDemoDbs(true), true);
+  await seedPlatformData(true);
+  await seedUsers();
+  for (const u of await platform.prepare('SELECT * FROM bm_user').all()) tokens[u.role] = auth.issueToken(u);
 
   app = express();
   app.use(express.json());
@@ -62,8 +62,8 @@ async function call(method, url, body, token) {
   return { status: r.status, body: await r.json() };
 }
 
-test('JWT: 签发与解析 round-trip', () => {
-  const u = platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get();
+test('JWT: 签发与解析 round-trip', async () => {
+  const u = await platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get();
   const t = auth.issueToken(u);
   assert.equal(t.split('.').length, 3);
   const claims = auth.parseToken(t);

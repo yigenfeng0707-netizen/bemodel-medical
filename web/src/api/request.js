@@ -4,7 +4,7 @@ import { ElMessage } from 'element-plus';
 const instance = axios.create({ baseURL: '/api', timeout: 180000 });
 instance.interceptors.request.use((cfg) => {
   const token = localStorage.getItem('bemodel_token');
-  if (token) cfg.headers.Authorization = `Bearer ${token}`;
+  if (token) cfg.headers['X-Token'] = token;
   return cfg;
 });
 instance.interceptors.response.use(

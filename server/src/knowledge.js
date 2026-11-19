@@ -121,16 +121,16 @@ export async function embed(texts, callType = 'EMBED_INGEST') {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const body = await resp.json();
     const data = (body.data || []).slice().sort((a, b) => a.index - b.index).map(d => d.embedding);
-    logEmbed(callType, true, Date.now() - started, null);
+    await logEmbed(callType, true, Date.now() - started, null);
     return data;
   } catch (e) {
-    logEmbed(callType, false, Date.now() - started, String(e.message || e).slice(0, 200));
+    await logEmbed(callType, false, Date.now() - started, String(e.message || e).slice(0, 200));
     return [];
   }
 }
-function logEmbed(callType, success, latencyMs, errMsg) {
+async function logEmbed(callType, success, latencyMs, errMsg) {
   try {
-    platform.prepare('INSERT INTO bm_llm_log(call_type,provider,model,ontology_version,prompt_digest,latency_ms,success,err_msg) VALUES (?,?,?,?,?,?,?,?)')
+    await platform.prepare('INSERT INTO bm_llm_log(call_type,provider,model,ontology_version,prompt_digest,latency_ms,success,err_msg) VALUES (?,?,?,?,?,?,?,?)')
       .run(callType, 'ollama', config.embedding.model, null, null, latencyMs, success ? 1 : 0, errMsg);
   } catch { /* ignore */ }
 }
@@ -142,40 +142,49 @@ export function cosine(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-// ==================== 混合检索（FTS5 关键词 + 向量余弦 → RRF k=60） ====================
+// ==================== 混合检索（pg_trgm 关键词 + 向量余弦 → RRF k=60） ====================
 function fulltextQuery(q) {
-  // 连续中文段滑窗取二字 bigram；英文数字整词；单字剥掉；词项封顶 24
-  const terms = [];
-  const segRe = /[\u4e00-\u9fa5]+|[a-zA-Z0-9]+/g;
-  let m;
-  while ((m = segRe.exec(q))) {
-    const seg = m[0];
-    if (/^[\u4e00-\u9fa5]+$/.test(seg)) {
-      for (let i = 0; i + 1 < seg.length; i++) terms.push(`"${seg.slice(i, i + 2)}"`);
-    } else if (seg.length >= 2) terms.push(`"${seg.toLowerCase()}"`);
-  }
-  // FTS5 多词默认 AND，bigram 全 AND 对自然语句几乎必 0 命中，改 OR 提升召回
-  return [...new Set(terms)].slice(0, 24).join(' OR ');
+  // pg_trgm 不需要预分词，直接返回原始查询字符串（可保留大小写）
+  return q.trim();
 }
 export async function knowledgeSearch(q, topN = 5) {
   const ftsQ = fulltextQuery(q);
   let keywordHits = [];
   if (ftsQ) {
     try {
-      keywordHits = platform.prepare(`
-        SELECT c.id, c.document_id, c.seq, c.heading, c.content,
-               bm25(bm_doc_chunk_fts) AS rank,
-               (SELECT title FROM bm_document d WHERE d.id=c.document_id AND d.status='PUBLISHED') AS docTitle
-        FROM bm_doc_chunk_fts f JOIN bm_doc_chunk c ON c.rowid=f.rowid
-        WHERE bm_doc_chunk_fts MATCH ? ORDER BY rank LIMIT 20`).all(ftsQ).filter(r => r.docTitle);
+      // pg_trgm 的 % 相似度对“短查询 vs 500 字长文”天然偏低（3/500≈0.006 < 默认阈值 0.3），中文召回差。
+      // 改用中文 bigram / 英数词元 ILIKE 子串召回（trgm GIN 索引同样加速 ILIKE），按命中元个数计分。
+      const tokens = new Set();
+      for (const run of ftsQ.match(/[\u4e00-\u9fa5]+|[A-Za-z0-9]+/g) || []) {
+        if (/^[\u4e00-\u9fa5]+$/.test(run)) {
+          if (run.length === 1) tokens.add(run);
+          else for (let i = 0; i < run.length - 1; i++) tokens.add(run.slice(i, i + 2));
+        } else tokens.add(run.toLowerCase());
+      }
+      const list = [...tokens].slice(0, 16);
+      if (list.length) {
+        const likes = list.map(() => 'f.content ILIKE ?').join(' OR ');
+        const score = list.map(() => '(CASE WHEN f.content ILIKE ? THEN 1 ELSE 0 END)').join(' + ');
+        const likesArgs = list.map(t => '%' + t + '%');
+        keywordHits = (await platform.prepare(`
+          SELECT c.id, c.document_id, c.seq, c.heading, c.content,
+                 (${score}) AS match_cnt,
+                 similarity(f.content, ?) AS rank,
+                 (SELECT title FROM bm_document d WHERE d.id=c.document_id AND d.status='PUBLISHED') AS doc_title
+          FROM bm_doc_chunk_fts f JOIN bm_doc_chunk c ON c.id=f.chunk_id
+          WHERE (${likes})
+          ORDER BY match_cnt DESC, rank DESC LIMIT 20`)
+          .all(...likesArgs, ftsQ, ...likesArgs));
+        keywordHits = keywordHits.filter(r => r.doc_title);
+      }
     } catch { keywordHits = []; }
   }
   // 向量路
   let vectorHits = [];
   const [qv] = await embed([q], 'EMBED_QUERY');
   if (qv) {
-    const rows = platform.prepare(`SELECT c.id, c.document_id, c.seq, c.heading, c.content, c.embedding,
-      (SELECT title FROM bm_document d WHERE d.id=c.document_id) AS docTitle
+    const rows = await platform.prepare(`SELECT c.id, c.document_id, c.seq, c.heading, c.content, c.embedding,
+      (SELECT title FROM bm_document d WHERE d.id=c.document_id) AS doc_title
       FROM bm_doc_chunk c JOIN bm_document d ON d.id=c.document_id
       WHERE d.status='PUBLISHED' AND c.embedding IS NOT NULL LIMIT 5000`).all();
     vectorHits = rows.map(r => ({ ...r, score: cosine(qv, JSON.parse(r.embedding)) }))
@@ -195,26 +204,16 @@ export async function knowledgeSearch(q, topN = 5) {
   addRank(keywordHits, r => r.id);
   addRank(vectorHits, r => r.id);
   return [...fused.values()].sort((a, b) => b.score - a.score).slice(0, topN)
-    .map(({ item }) => ({ documentId: item.document_id, seq: item.seq, heading: item.heading, content: item.content, docTitle: item.docTitle }));
+    .map(({ item }) => ({ documentId: item.document_id, seq: item.seq, heading: item.heading, content: item.content, docTitle: item.doc_title }));
 }
 
 // ==================== 文档生命周期 ====================
-R.get('/documents', (req, res) => {
-  const rows = platform.prepare(`
+R.get('/documents', async (req, res) => {
+  const rows = await platform.prepare(`
     SELECT d.*, (SELECT COUNT(*) FROM bm_doc_chunk c WHERE c.document_id=d.id) chunk_count
     FROM bm_document d ORDER BY d.id DESC`).all();
   res.json(ok(rows));
 });
-// 中文 bigram 预切分：unicode61 分词器会把连续中文切成单 token，bigram 查询无法命中；
-// 索引侧把中文段预切成空格分隔的二字词，与 fulltextQuery 的 bigram 查询构造对齐
-function cjkBigramText(text) {
-  return text.replace(/[\u4e00-\u9fa5]+/g, seg => {
-    if (seg.length === 1) return seg;
-    const parts = [];
-    for (let i = 0; i + 1 < seg.length; i++) parts.push(seg.slice(i, i + 2));
-    return parts.join(' ');
-  });
-}
 
 R.post('/documents', upload.single('file'), async (req, res) => {
   const buf = req.file?.buffer;
@@ -224,48 +223,50 @@ R.post('/documents', upload.single('file'), async (req, res) => {
   const title = path.basename(filename, path.extname(filename));
   const text = parseDoc(filename, buf);
   const hash = crypto.createHash('sha256').update(text).digest('hex');
-  const dup = platform.prepare("SELECT id FROM bm_document WHERE content_hash=? AND status<>'DEPRECATED'").get(hash);
+  const dup = await platform.prepare("SELECT id FROM bm_document WHERE content_hash=? AND status<>'DEPRECATED'").get(hash);
   if (dup) throw new BizException('内容重复：相同内容文档已存在');
-  const verRow = platform.prepare('SELECT COALESCE(MAX(version),0)+1 v FROM bm_document WHERE title=?').get(title);
-  const r = platform.prepare(`INSERT INTO bm_document(title,doc_type,source,status,version,owner,uploaded_by,file_size,content_hash,content_text)
+  const verRow = await platform.prepare('SELECT COALESCE(MAX(version),0)+1 v FROM bm_document WHERE title=?').get(title);
+  const r = await platform.prepare(`INSERT INTO bm_document(title,doc_type,source,status,version,owner,uploaded_by,file_size,content_hash,content_text)
     VALUES (?,?,?,?,?,?,?,?,?,?)`)
     .run(title, docTypeOf(filename), 'UPLOAD', 'DRAFT', verRow.v, req.body?.owner || currentUser(req)?.displayName || '', currentUser(req)?.username || '', buf.length, hash, text);
   const docId = r.lastInsertRowid;
   const chunks = chunkText(text);
   const insChunk = platform.prepare('INSERT INTO bm_doc_chunk(document_id,seq,heading,content) VALUES (?,?,?,?)');
-  const insFts = platform.prepare('INSERT INTO bm_doc_chunk_fts(content) VALUES (?)');
+  const insFts = platform.prepare('INSERT INTO bm_doc_chunk_fts(chunk_id,content) VALUES (?,?)');
   for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
     const batch = chunks.slice(i, i + EMBED_BATCH);
     const vectors = await embed(batch.map(c => c.content));
-    batch.forEach((c, j) => {
-      const rr = insChunk.run(docId, i + j, c.heading, c.content);
-      if (vectors[j]) platform.prepare('UPDATE bm_doc_chunk SET embedding=? WHERE id=?').run(JSON.stringify(vectors[j]), rr.lastInsertRowid);
-      insFts.run(cjkBigramText(c.content));
-    });
+    for (let j = 0; j < batch.length; j++) {
+      const c = batch[j];
+      const rr = await insChunk.run(docId, i + j, c.heading, c.content);
+      if (vectors[j]) await platform.prepare('UPDATE bm_doc_chunk SET embedding=? WHERE id=?').run(JSON.stringify(vectors[j]), rr.lastInsertRowid);
+      await insFts.run(rr.lastInsertRowid, c.content);
+    }
   }
   res.json(ok({ id: docId, chunks: chunks.length }));
 });
-R.get('/documents/:id/chunks', (req, res) => {
-  res.json(ok(platform.prepare('SELECT id, seq, heading, content, (embedding IS NOT NULL) AS has_embedding FROM bm_doc_chunk WHERE document_id=? ORDER BY seq').all(req.params.id)));
+R.get('/documents/:id/chunks', async (req, res) => {
+  res.json(ok(await platform.prepare('SELECT id, seq, heading, content, (embedding IS NOT NULL)::int AS has_embedding FROM bm_doc_chunk WHERE document_id=? ORDER BY seq').all(req.params.id)));
 });
 // 运维端点：重嵌 NULL 分块（向量路曾不可用时的补齐入口；失败分块保持 NULL，诚实降级走关键词路）
 R.post('/documents/revectorize', async (req, res) => {
-  const rows = platform.prepare('SELECT id, content FROM bm_doc_chunk WHERE embedding IS NULL ORDER BY id').all();
+  const rows = await platform.prepare('SELECT id, content FROM bm_doc_chunk WHERE embedding IS NULL ORDER BY id').all();
   let updated = 0;
   for (let i = 0; i < rows.length; i += EMBED_BATCH) {
     const batch = rows.slice(i, i + EMBED_BATCH);
     const vectors = await embed(batch.map(r => r.content));
-    batch.forEach((r, j) => {
+    for (let j = 0; j < batch.length; j++) {
       if (vectors[j]) {
-        platform.prepare('UPDATE bm_doc_chunk SET embedding=? WHERE id=?').run(JSON.stringify(vectors[j]), r.id);
+        await platform.prepare('UPDATE bm_doc_chunk SET embedding=? WHERE id=?').run(JSON.stringify(vectors[j]), batch[j].id);
         updated++;
       }
-    });
+    }
   }
-  res.json(ok({ updated, remaining: platform.prepare('SELECT COUNT(*) n FROM bm_doc_chunk WHERE embedding IS NULL').get().n }));
+  const remainingRow = await platform.prepare('SELECT COUNT(*) n FROM bm_doc_chunk WHERE embedding IS NULL').get();
+  res.json(ok({ updated, remaining: remainingRow.n }));
 });
-R.post('/documents/:id/transition', (req, res) => {
-  const doc = platform.prepare('SELECT * FROM bm_document WHERE id=?').get(req.params.id);
+R.post('/documents/:id/transition', async (req, res) => {
+  const doc = await platform.prepare('SELECT * FROM bm_document WHERE id=?').get(req.params.id);
   if (!doc) throw new BizException('文档不存在');
   const target = req.body?.target || req.query.target;
   checkTransition(doc.status, target);
@@ -274,57 +275,57 @@ R.post('/documents/:id/transition', (req, res) => {
     if (currentUser(req).role === 'REVIEWER' && doc.uploaded_by && doc.uploaded_by === currentUser(req).username) {
       throw new BizException('评审员不得发布本人上传的文档（防自审）');
     }
-    platform.prepare("UPDATE bm_document SET status='DEPRECATED' WHERE title=? AND status='PUBLISHED' AND id<>?").run(doc.title, doc.id);
+    await platform.prepare("UPDATE bm_document SET status='DEPRECATED' WHERE title=? AND status='PUBLISHED' AND id<>?").run(doc.title, doc.id);
   }
-  platform.prepare('UPDATE bm_document SET status=?, updated_at=? WHERE id=?').run(target, now(), doc.id);
+  await platform.prepare('UPDATE bm_document SET status=?, updated_at=? WHERE id=?').run(target, now(), doc.id);
   res.json(ok(true));
 });
-R.delete('/documents/:id', (req, res) => {
-  const doc = platform.prepare('SELECT * FROM bm_document WHERE id=?').get(req.params.id);
+R.delete('/documents/:id', async (req, res) => {
+  const doc = await platform.prepare('SELECT * FROM bm_document WHERE id=?').get(req.params.id);
   if (!doc) throw new BizException('文档不存在');
   if (doc.status === 'PUBLISHED') throw new BizException('已发布文档不可删除，只可停用');
-  platform.prepare('DELETE FROM bm_doc_chunk WHERE document_id=?').run(doc.id);
-  platform.prepare('DELETE FROM bm_document WHERE id=?').run(doc.id);
+  await platform.prepare('DELETE FROM bm_doc_chunk WHERE document_id=?').run(doc.id);
+  await platform.prepare('DELETE FROM bm_document WHERE id=?').run(doc.id);
   res.json(ok(true));
 });
 
 // ==================== 知识条目 ====================
-R.get('/entries', (req, res) => {
-  res.json(ok(platform.prepare('SELECT * FROM bm_knowledge ORDER BY id').all()));
+R.get('/entries', async (req, res) => {
+  res.json(ok(await platform.prepare('SELECT * FROM bm_knowledge ORDER BY id').all()));
 });
-R.post('/entries', (req, res) => {
+R.post('/entries', async (req, res) => {
   const b = req.body || {};
   if (!b.code || !b.title || !b.content) throw new BizException('编码/标题/内容不能为空');
-  if (platform.prepare('SELECT 1 FROM bm_knowledge WHERE code=?').get(b.code)) throw new BizException('条目编码已存在');
-  platform.prepare('INSERT INTO bm_knowledge(code,title,content,applies_to,concept_code,source,status,version,owner) VALUES (?,?,?,?,?,?,?,?,?)')
+  if (await platform.prepare('SELECT 1 FROM bm_knowledge WHERE code=?').get(b.code)) throw new BizException('条目编码已存在');
+  await platform.prepare('INSERT INTO bm_knowledge(code,title,content,applies_to,concept_code,source,status,version,owner) VALUES (?,?,?,?,?,?,?,?,?)')
     .run(b.code, b.title, b.content, b.appliesTo || '', b.conceptCode || null, 'ADMIN', 'DRAFT', 1, b.owner || currentUser(req)?.displayName || '');
   res.json(ok(true));
 });
-R.put('/entries/:id', (req, res) => {
-  const e = platform.prepare('SELECT * FROM bm_knowledge WHERE id=?').get(req.params.id);
+R.put('/entries/:id', async (req, res) => {
+  const e = await platform.prepare('SELECT * FROM bm_knowledge WHERE id=?').get(req.params.id);
   if (!e) throw new BizException('条目不存在');
   // 已发布条目再次保存自动回 REVIEW（改一条走审批）
   const nextStatus = e.status === 'PUBLISHED' ? 'REVIEW' : e.status;
-  platform.prepare('UPDATE bm_knowledge SET title=?, content=?, applies_to=?, owner=?, status=?, updated_at=? WHERE id=?')
+  await platform.prepare('UPDATE bm_knowledge SET title=?, content=?, applies_to=?, owner=?, status=?, updated_at=? WHERE id=?')
     .run(req.body.title ?? e.title, req.body.content ?? e.content, req.body.appliesTo ?? e.applies_to,
       req.body.owner ?? e.owner, nextStatus, now(), e.id);
   res.json(ok(true));
 });
-R.post('/entries/:id/transition', (req, res) => {
-  const e = platform.prepare('SELECT * FROM bm_knowledge WHERE id=?').get(req.params.id);
+R.post('/entries/:id/transition', async (req, res) => {
+  const e = await platform.prepare('SELECT * FROM bm_knowledge WHERE id=?').get(req.params.id);
   if (!e) throw new BizException('条目不存在');
   const target = req.body?.target || req.query.target;
   checkTransition(e.status, target);
   if (target === 'PUBLISHED' && !hasAnyRole(req, 'REVIEWER', 'ADMIN')) throw new BizException('发布需评审员或管理员');
-  platform.prepare('UPDATE bm_knowledge SET status=?, version=version+?, updated_at=? WHERE id=?').run(target, target === 'PUBLISHED' ? 1 : 0, now(), e.id);
+  await platform.prepare('UPDATE bm_knowledge SET status=?, version=version+?, updated_at=? WHERE id=?').run(target, target === 'PUBLISHED' ? 1 : 0, now(), e.id);
   res.json(ok(true));
 });
 
 // 统一读取口：仅 PUBLISHED 返回正文
-export function entryContent(code) {
-  const e = platform.prepare("SELECT content FROM bm_knowledge WHERE code=? AND status='PUBLISHED'").get(code);
+export async function entryContent(code) {
+  const e = await platform.prepare("SELECT content FROM bm_knowledge WHERE code=? AND status='PUBLISHED'").get(code);
   return e ? e.content : null;
 }
-export function basisEntries(conceptCode) {
-  return platform.prepare("SELECT code, title, content FROM bm_knowledge WHERE status='PUBLISHED' AND (',' || applies_to || ',') LIKE ? ORDER BY id").all(`%,${conceptCode},%`);
+export async function basisEntries(conceptCode) {
+  return await platform.prepare("SELECT code, title, content FROM bm_knowledge WHERE status='PUBLISHED' AND (',' || applies_to || ',') LIKE ? ORDER BY id").all(`%,${conceptCode},%`);
 }

@@ -1,20 +1,17 @@
 // 发布门禁集成测试（隔离 DATA_DIR；HTTP 层 + OWL 解析 + 闭包物化 + 版本递增）
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import express from 'express';
 
 const dir = path.resolve('data-test', 'release');
-fs.rmSync(dir, { recursive: true, force: true });
-fs.mkdirSync(dir, { recursive: true });
 process.env.DATA_DIR = dir;
 
 let app, server, adminToken, viewerToken, seedPlatformData, checkOntology;
 
 before(async () => {
-  const { platform } = await import('../src/db.js');
+  const { platform, ensureDatabases } = await import('../src/db.js');
   const { seedDemoDbs } = await import('../src/seed/demo.js');
   ({ seedPlatformData } = await import('../src/seed/platform.js'));
   ({ checkOntology } = await import('../src/ontology.js'));
@@ -22,9 +19,11 @@ before(async () => {
   const { requireAuth, authorize, issueToken, seedUsers } = await import('../src/auth.js');
   const { BizException, ok } = await import('../src/common.js');
 
-  assert.equal(seedDemoDbs(true), true);
-  seedPlatformData();
-  seedUsers();
+  await ensureDatabases();
+  await platform.initSchema();
+  assert.equal(await seedDemoDbs(true), true);
+  await seedPlatformData(true);
+  await seedUsers();
 
   app = express();
   app.use(express.json({ limit: '20mb' }));
@@ -36,7 +35,7 @@ before(async () => {
     if (err) res.status(200).json({ code: 500, msg: err.message || 'err', data: null });
   });
 
-  const users = platform.prepare('SELECT * FROM bm_user').all();
+  const users = await platform.prepare('SELECT * FROM bm_user').all();
   adminToken = issueToken(users.find(u => u.username === 'admin'));
   viewerToken = issueToken(users.find(u => u.username === 'viewer'));
 
@@ -67,7 +66,7 @@ test('未登录发布被拒 401', async () => {
 });
 
 test('发布: 种子本体可发布（BLOCKER=0，WARN 需 force）', async () => {
-  const check = checkOntology();
+  const check = await checkOntology();
   assert.equal(check.blockerCount, 0);
   const first = await call('POST', '/api/release/publish', { changeSummary: '首版' }, adminToken);
   if (check.defects.length > 0) {
@@ -85,13 +84,13 @@ test('发布: 种子本体可发布（BLOCKER=0，WARN 需 force）', async () =
 
 test('发布快照: 元素计数>0、闭包已物化、审批留痕', async () => {
   const { platform } = await import('../src/db.js');
-  const rel = platform.prepare('SELECT * FROM bm_release ORDER BY id DESC LIMIT 1').get();
+  const rel = await platform.prepare('SELECT * FROM bm_release ORDER BY id DESC LIMIT 1').get();
   assert.ok(rel.element_count > 0);
   assert.equal(rel.approved_by, 'admin');
   const snap = JSON.parse(rel.snapshot_json);
   assert.ok(snap.concepts.length >= 44);
   assert.ok(snap.relationClosures && Object.keys(snap.relationClosures).length >= 1);
-  const closureRows = platform.prepare('SELECT COUNT(*) n FROM bm_relation_closure').get().n;
+  const closureRows = (await platform.prepare('SELECT COUNT(*) n FROM bm_relation_closure').get()).n;
   assert.equal(closureRows, Object.values(snap.relationClosures).reduce((s, r) => s + r.derived, 0));
 });
 
@@ -148,12 +147,12 @@ test('OWL RDF-XML 解析与执行导入: 概念/关系/属性落库', async () =
   const sum = exec.body.data.summary;
   assert.equal(sum.created, 4);
   const { platform } = await import('../src/db.js');
-  assert.ok(platform.prepare("SELECT 1 FROM bm_domain WHERE code='IMPORT'").get());
-  const c = platform.prepare("SELECT * FROM bm_concept WHERE code='WARD_ROUND'").get();
+  assert.ok(await platform.prepare("SELECT 1 FROM bm_domain WHERE code='IMPORT'").get());
+  const c = await platform.prepare("SELECT * FROM bm_concept WHERE code='WARD_ROUND'").get();
   assert.equal(c.name, '查房');
   assert.equal(c.iri, 'http://ex.org#WardRound');
-  assert.ok(platform.prepare("SELECT 1 FROM bm_relation WHERE from_concept='WARD_ROUND' AND to_concept='CLINICAL_EVENT' AND relation_name='duringRound'").get());
-  const a = platform.prepare("SELECT * FROM bm_attribute WHERE concept_code='WARD_ROUND' AND attr_code='ROUND_DATE'").get();
+  assert.ok(await platform.prepare("SELECT 1 FROM bm_relation WHERE from_concept='WARD_ROUND' AND to_concept='CLINICAL_EVENT' AND relation_name='duringRound'").get());
+  const a = await platform.prepare("SELECT * FROM bm_attribute WHERE concept_code='WARD_ROUND' AND attr_code='ROUND_DATE'").get();
   assert.equal(a.data_type, 'DATE');
   // 幂等：重复导入变 UPDATE，不再 CREATE
   const again = await call('POST', '/api/ontology/import/execute', { content: xml, filename: 'onto.rdf' }, adminToken);

@@ -1,6 +1,5 @@
 import express from 'express';
-import fs from 'node:fs';
-import { platform, now, businessDb } from './db.js';
+import { platform, now, businessDb, businessDbByFile } from './db.js';
 import { config } from './config.js';
 import { BizException, ok, encryptSecret, decryptSecret, maskPatientRow, isNameKey } from './common.js';
 import { currentUser } from './auth.js';
@@ -12,70 +11,72 @@ const R = datasourceRouter;
 
 // ---------- 数据源注册 ----------
 function maskDs(d) { return { ...d, password: '****' }; }
-R.get('/list', (req, res) => {
-  res.json(ok(platform.prepare('SELECT * FROM bm_datasource ORDER BY id').all().map(maskDs)));
+R.get('/list', async (req, res) => {
+  const rows = await platform.prepare('SELECT * FROM bm_datasource ORDER BY id').all();
+  res.json(ok(rows.map(maskDs)));
 });
-R.post('/', (req, res) => {
+R.post('/', async (req, res) => {
   const b = req.body || {};
   if (!b.dsCode || !b.dsName) throw new BizException('编码与名称不能为空');
-  if (platform.prepare('SELECT 1 FROM bm_datasource WHERE ds_code=?').get(b.dsCode)) throw new BizException('数据源编码已存在');
-  // 复现版数据源 = SQLite 库文件（数据不搬家：平台只登记与映射，不复制数据）
-  const file = config.demoDbs[b.dsCode] || b.db_name;
-  if (!file || !fs.existsSync(file)) throw new BizException(`库文件不存在：${file}（演示库须先由 DataSeeder 生成）`);
-  platform.prepare('INSERT INTO bm_datasource(ds_code,ds_name,product_name,db_type,host,port,db_name,username,password) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run(b.dsCode, b.dsName, b.productName || '', 'SQLITE', '127.0.0.1', 0, file, b.username || 'demo', encryptSecret('demo'));
-  res.json(ok(maskDs(platform.prepare('SELECT * FROM bm_datasource WHERE ds_code=?').get(b.dsCode))));
+  if (await platform.prepare('SELECT 1 FROM bm_datasource WHERE ds_code=?').get(b.dsCode)) throw new BizException('数据源编码已存在');
+  // PG 迁移：数据源 = 独立 database，db_name 即 database 名（演示库须先由 DataSeeder/ensureDatabases 创建）
+  const file = config.pg.demoDbs[b.dsCode] || b.db_name;
+  if (!file) throw new BizException(`数据库名不能为空`);
+  await platform.prepare('INSERT INTO bm_datasource(ds_code,ds_name,product_name,db_type,host,port,db_name,username,password) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(b.dsCode, b.dsName, b.productName || '', 'POSTGRESQL', '127.0.0.1', 0, file, b.username || 'demo', encryptSecret('demo'));
+  res.json(ok(maskDs(await platform.prepare('SELECT * FROM bm_datasource WHERE ds_code=?').get(b.dsCode))));
 });
-R.post('/test', (req, res) => {
+R.post('/test', async (req, res) => {
   const b = req.body || {};
   try {
-    const ds = platform.prepare('SELECT * FROM bm_datasource WHERE ds_code=?').get(b.dsCode);
-    const file = ds ? ds.db_name : (config.demoDbs[b.dsCode] || b.db_name);
-    const db = businessDbByFile2(file);
-    db.prepare('SELECT 1').get();
+    const ds = await platform.prepare('SELECT * FROM bm_datasource WHERE ds_code=?').get(b.dsCode);
+    const file = ds ? ds.db_name : (config.pg.demoDbs[b.dsCode] || b.db_name);
+    const { db } = await businessDbByFile(file);
+    await db.prepare('SELECT 1').get();
     res.json(ok(true));
   } catch (e) { res.json(ok(false)); }
 });
-function businessDbByFile2(file) {
-  if (file && fs.existsSync(file)) return businessDb(resolveDsByFile(file));
-  throw new Error('库文件不存在');
-}
-function resolveDsByFile(file) {
-  for (const [k, v] of Object.entries(config.demoDbs)) if (v === file || v.endsWith(String(file))) return k;
-  return file;
+async function businessDbByFile2(file) {
+  // PG 迁移：database 名即连接目标，直接尝试连接（未知库名由 businessDbByFile 直接连）
+  return await businessDbByFile(file);
 }
 
 // ---------- 物理快照扫描（等价 information_schema 扫描） ----------
-R.post('/scan/:dsCode', (req, res) => {
+R.post('/scan/:dsCode', async (req, res) => {
   const dsCode = req.params.dsCode;
-  const db = businessDb(dsCode);
-  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%' ORDER BY name").all();
+  const db = await businessDb(dsCode);
+  const tables = await db.prepare("SELECT table_name AS name FROM information_schema.tables WHERE table_schema='public' AND table_name NOT LIKE 'pg_%' AND table_name NOT LIKE 'sqlite_%' ORDER BY table_name").all();
   const delT = platform.prepare('DELETE FROM bm_physical_table WHERE ds_code=?');
   const delC = platform.prepare('DELETE FROM bm_physical_column WHERE ds_code=?');
   const insT = platform.prepare('INSERT INTO bm_physical_table(ds_code,table_name,table_comment,scanned_at) VALUES (?,?,?,?)');
   const insC = platform.prepare('INSERT INTO bm_physical_column(ds_code,table_name,column_name,data_type,column_comment,is_pk,ordinal_position) VALUES (?,?,?,?,?,?,?)');
-  delT.run(dsCode); delC.run(dsCode);
+  await delT.run(dsCode); await delC.run(dsCode);
   const st = now();
   for (const t of tables) {
-    insT.run(dsCode, t.name, '', st);
-    const cols = db.prepare(`PRAGMA table_info(${t.name})`).all();
-    cols.forEach((c, i) => insC.run(dsCode, t.name, c.name, c.type || 'TEXT', '', c.pk ? 1 : 0, i + 1));
+    await insT.run(dsCode, t.name, '', st);
+    const cols = await db.prepare('SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema=? AND table_name=? ORDER BY ordinal_position').all('public', t.name);
+    const pkRows = await db.prepare("SELECT column_name FROM information_schema.key_column_usage WHERE table_schema=? AND table_name=? AND constraint_name='PRIMARY'").all('public', t.name);
+    const pkSet = new Set(pkRows.map(r => r.column_name));
+    for (let i = 0; i < cols.length; i++) {
+      const c = cols[i];
+      await insC.run(dsCode, t.name, c.column_name, c.data_type || 'TEXT', '', pkSet.has(c.column_name) ? 1 : 0, i + 1);
+    }
   }
   res.json(ok({ dsCode, tableCount: tables.length }));
 });
-R.get('/tables/:dsCode', (req, res) => {
-  res.json(ok(platform.prepare('SELECT * FROM bm_physical_table WHERE ds_code=? ORDER BY table_name').all(req.params.dsCode)));
+R.get('/tables/:dsCode', async (req, res) => {
+  res.json(ok(await platform.prepare('SELECT * FROM bm_physical_table WHERE ds_code=? ORDER BY table_name').all(req.params.dsCode)));
 });
-R.get('/columns/:dsCode', (req, res) => {
+R.get('/columns/:dsCode', async (req, res) => {
   const { tableName } = req.query;
   const rows = tableName
-    ? platform.prepare('SELECT * FROM bm_physical_column WHERE ds_code=? AND table_name=? ORDER BY ordinal_position').all(req.params.dsCode, tableName)
-    : platform.prepare('SELECT * FROM bm_physical_column WHERE ds_code=? ORDER BY table_name, ordinal_position').all(req.params.dsCode);
+    ? await platform.prepare('SELECT * FROM bm_physical_column WHERE ds_code=? AND table_name=? ORDER BY ordinal_position').all(req.params.dsCode, tableName)
+    : await platform.prepare('SELECT * FROM bm_physical_column WHERE ds_code=? ORDER BY table_name, ordinal_position').all(req.params.dsCode);
   res.json(ok(rows));
 });
 
 // ---------- 语义映射 ----------
-R.get('/mapping/list', (req, res) => {
+R.get('/mapping/list', async (req, res) => {
   const { dsCode, tableName, status } = req.query;
   let sql = 'SELECT * FROM bm_mapping WHERE 1=1';
   const params = [];
@@ -83,17 +84,17 @@ R.get('/mapping/list', (req, res) => {
   if (tableName) { sql += ' AND table_name=?'; params.push(tableName); }
   if (status) { sql += ' AND status=?'; params.push(status); }
   sql += ' ORDER BY ds_code, table_name, column_name, id';
-  res.json(ok(platform.prepare(sql).all(...params)));
+  res.json(ok(await platform.prepare(sql).all(...params)));
 });
-function logMapping(mappingId, action, before, after) {
-  platform.prepare('INSERT INTO bm_mapping_log(mapping_id,action,before_json,after_json,operator) VALUES (?,?,?,?,?)')
+async function logMapping(mappingId, action, before, after) {
+  await platform.prepare('INSERT INTO bm_mapping_log(mapping_id,action,before_json,after_json,operator) VALUES (?,?,?,?,?)')
     .run(mappingId, action, before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null, currentUser(null)?.username || 'system');
 }
-function logMappingReq(mappingId, action, before, after, username) {
-  platform.prepare('INSERT INTO bm_mapping_log(mapping_id,action,before_json,after_json,operator) VALUES (?,?,?,?,?)')
+async function logMappingReq(mappingId, action, before, after, username) {
+  await platform.prepare('INSERT INTO bm_mapping_log(mapping_id,action,before_json,after_json,operator) VALUES (?,?,?,?,?)')
     .run(mappingId, action, before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null, username);
 }
-R.post('/mapping/batch', (req, res) => {
+R.post('/mapping/batch', async (req, res) => {
   const list = Array.isArray(req.body) ? req.body : [];
   const user = currentUser(req)?.username || '';
   let n = 0;
@@ -102,63 +103,67 @@ R.post('/mapping/batch', (req, res) => {
     let status = b.status;
     if (!status) status = b.source === 'AI' ? 'PROPOSED' : 'ACTIVE'; // AI 落提议待审，人工直接生效
     if (!['PROPOSED', 'ACTIVE', 'DEPRECATED'].includes(status)) throw new BizException(`非法映射状态 ${status}`);
-    const exist = platform.prepare('SELECT * FROM bm_mapping WHERE ds_code=? AND table_name=? AND column_name=? AND concept_code=? AND attr_code=?')
+    const exist = await platform.prepare('SELECT * FROM bm_mapping WHERE ds_code=? AND table_name=? AND column_name=? AND concept_code=? AND attr_code=?')
       .get(b.dsCode, b.tableName, b.columnName, b.conceptCode, b.attrCode || '');
     if (exist) {
       const before = { ...exist };
       const nextStatus = exist.status === 'ACTIVE' && status === 'PROPOSED' ? 'PROPOSED' : status; // 生效内容变更须重新生效
-      platform.prepare('UPDATE bm_mapping SET value_map=?, confirmed=?, source=?, status=?, updated_by=?, updated_at=? WHERE id=?')
+      await platform.prepare('UPDATE bm_mapping SET value_map=?, confirmed=?, source=?, status=?, updated_by=?, updated_at=? WHERE id=?')
         .run(b.valueMap || null, b.confirmed ? 1 : 0, b.source || 'MANUAL', nextStatus, user, now(), exist.id);
-      logMappingReq(exist.id, 'UPDATE', before, platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(exist.id), user);
+      const after = await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(exist.id);
+      await logMappingReq(exist.id, 'UPDATE', before, after, user);
     } else {
-      const r = platform.prepare(`INSERT INTO bm_mapping(ds_code,table_name,column_name,concept_code,attr_code,value_map,confirmed,source,status,updated_by,updated_at)
+      const r = await platform.prepare(`INSERT INTO bm_mapping(ds_code,table_name,column_name,concept_code,attr_code,value_map,confirmed,source,status,updated_by,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
         .run(b.dsCode, b.tableName, b.columnName, b.conceptCode, b.attrCode || '', b.valueMap || null, b.confirmed ? 1 : 0, b.source || 'MANUAL', status, user, now());
-      logMappingReq(r.lastInsertRowid, 'CREATE', null, platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(r.lastInsertRowid), user);
+      const after = await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(r.lastInsertRowid);
+      await logMappingReq(r.lastInsertRowid, 'CREATE', null, after, user);
     }
     n++;
   }
   res.json(ok(n));
 });
-R.put('/mapping/:id', (req, res) => {
-  const old = platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(req.params.id);
+R.put('/mapping/:id', async (req, res) => {
+  const old = await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(req.params.id);
   if (!old) throw new BizException('映射不存在');
   const before = { ...old };
-  platform.prepare('UPDATE bm_mapping SET concept_code=?, attr_code=?, value_map=?, confirmed=?, updated_by=?, updated_at=? WHERE id=?')
+  await platform.prepare('UPDATE bm_mapping SET concept_code=?, attr_code=?, value_map=?, confirmed=?, updated_by=?, updated_at=? WHERE id=?')
     .run(req.body.conceptCode ?? old.concept_code, req.body.attrCode ?? old.attr_code, req.body.valueMap ?? old.value_map,
       (req.body.confirmed ?? old.confirmed) ? 1 : 0, currentUser(req)?.username || '', now(), req.params.id);
-  logMappingReq(old.id, 'UPDATE', before, platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(old.id), currentUser(req)?.username || '');
-  res.json(ok(platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(old.id)));
+  const after = await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(old.id);
+  await logMappingReq(old.id, 'UPDATE', before, after, currentUser(req)?.username || '');
+  res.json(ok(await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(old.id)));
 });
-R.post('/mapping/:id/transition', (req, res) => {
-  const old = platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(req.params.id);
+R.post('/mapping/:id/transition', async (req, res) => {
+  const old = await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(req.params.id);
   if (!old) throw new BizException('映射不存在');
   const target = req.body?.target || req.query.target;
   const allowed = { PROPOSED: ['ACTIVE'], ACTIVE: ['DEPRECATED'], DEPRECATED: ['ACTIVE'] };
   if (!allowed[old.status]?.includes(target)) throw new BizException(`非法映射生命周期流转：${old.status} → ${target}`);
-  platform.prepare('UPDATE bm_mapping SET status=?, updated_by=?, updated_at=? WHERE id=?').run(target, currentUser(req)?.username || '', now(), old.id);
-  logMappingReq(old.id, 'TRANSITION', old, platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(old.id), currentUser(req)?.username || '');
-  res.json(ok(platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(old.id)));
+  await platform.prepare('UPDATE bm_mapping SET status=?, updated_by=?, updated_at=? WHERE id=?').run(target, currentUser(req)?.username || '', now(), old.id);
+  const after = await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(old.id);
+  await logMappingReq(old.id, 'TRANSITION', old, after, currentUser(req)?.username || '');
+  res.json(ok(await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(old.id)));
 });
-R.get('/mapping/:id/log', (req, res) => {
-  res.json(ok(platform.prepare('SELECT * FROM bm_mapping_log WHERE mapping_id=? ORDER BY id DESC').all(req.params.id)));
+R.get('/mapping/:id/log', async (req, res) => {
+  res.json(ok(await platform.prepare('SELECT * FROM bm_mapping_log WHERE mapping_id=? ORDER BY id DESC').all(req.params.id)));
 });
-R.delete('/mapping/:id', (req, res) => {
-  const old = platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(req.params.id);
+R.delete('/mapping/:id', async (req, res) => {
+  const old = await platform.prepare('SELECT * FROM bm_mapping WHERE id=?').get(req.params.id);
   if (old) {
-    logMappingReq(old.id, 'DELETE', old, null, currentUser(req)?.username || '');
-    platform.prepare('DELETE FROM bm_mapping WHERE id=?').run(old.id);
+    await logMappingReq(old.id, 'DELETE', old, null, currentUser(req)?.username || '');
+    await platform.prepare('DELETE FROM bm_mapping WHERE id=?').run(old.id);
   }
   res.json(ok(true));
 });
 
 // ---------- AI 推荐绑定 ----------
-function topKConcepts(columns) {
+async function topKConcepts(columns) {
   const k = config.mapping.topKConcepts;
-  const concepts = platform.prepare("SELECT code, name, domain_code FROM bm_concept WHERE status='PUBLISHED'").all();
+  const concepts = await platform.prepare("SELECT code, name, domain_code FROM bm_concept WHERE status='PUBLISHED'").all();
   if (k <= 0 || concepts.length <= k) return concepts;
-  const attrs = platform.prepare("SELECT concept_code, attr_code, attr_name FROM bm_attribute").all();
-  const terms = platform.prepare('SELECT term, concept_code FROM bm_term').all();
+  const attrs = await platform.prepare("SELECT concept_code, attr_code, attr_name FROM bm_attribute").all();
+  const terms = await platform.prepare('SELECT term, concept_code FROM bm_term').all();
   const byConcept = new Map();
   for (const c of concepts) byConcept.set(c.code, { needles: [], valid: 0 });
   const addNeedle = (code, n) => {
@@ -192,12 +197,12 @@ function topKConcepts(columns) {
 R.get('/mapping/ai-suggest', async (req, res) => {
   const { dsCode, tableName } = req.query;
   if (!dsCode || !tableName) throw new BizException('dsCode 与 tableName 必填');
-  const columns = platform.prepare('SELECT * FROM bm_physical_column WHERE ds_code=? AND table_name=? ORDER BY ordinal_position').all(dsCode, tableName);
+  const columns = await platform.prepare('SELECT * FROM bm_physical_column WHERE ds_code=? AND table_name=? ORDER BY ordinal_position').all(dsCode, tableName);
   if (!columns.length) throw new BizException('物理列不存在，请先扫描数据源');
-  const concepts = platform.prepare("SELECT code, name, domain_code FROM bm_concept WHERE status='PUBLISHED' ORDER BY code").all();
-  const attrs = platform.prepare('SELECT concept_code, attr_code, attr_name, data_type FROM bm_attribute ORDER BY sort').all();
-  const terms = platform.prepare('SELECT term, concept_code FROM bm_term').all();
-  const chosen = topKConcepts(columns);
+  const concepts = await platform.prepare("SELECT code, name, domain_code FROM bm_concept WHERE status='PUBLISHED' ORDER BY code").all();
+  const attrs = await platform.prepare('SELECT concept_code, attr_code, attr_name, data_type FROM bm_attribute ORDER BY sort').all();
+  const terms = await platform.prepare('SELECT term, concept_code FROM bm_term').all();
+  const chosen = await topKConcepts(columns);
   const chosenSet = new Set(chosen.map(c => c.code));
   const attrByConcept = new Map();
   for (const a of attrs) if (chosenSet.has(a.concept_code)) (attrByConcept.get(a.concept_code) || attrByConcept.set(a.concept_code, []).get(a.concept_code)).push(a);
@@ -243,15 +248,15 @@ R.get('/mapping/ai-suggest', async (req, res) => {
 });
 
 // ---------- 实例浏览（概念 → ACTIVE 映射 → 物理行投影） ----------
-R.get('/instance/:conceptCode', (req, res) => {
+R.get('/instance/:conceptCode', async (req, res) => {
   const code = req.params.conceptCode;
   const { tableName, pageNum = 1, pageSize = 20 } = req.query;
-  const concept = platform.prepare('SELECT * FROM bm_concept WHERE code=?').get(code);
+  const concept = await platform.prepare('SELECT * FROM bm_concept WHERE code=?').get(code);
   if (!concept) throw new BizException('概念不存在');
   if (concept.status === 'DEPRECATED') throw new BizException('概念已废弃，实例不可投影');
-  const attrs = platform.prepare('SELECT * FROM bm_attribute WHERE concept_code=? ORDER BY sort').all(code);
+  const attrs = await platform.prepare('SELECT * FROM bm_attribute WHERE concept_code=? ORDER BY sort').all(code);
   const attrName = new Map(attrs.map(a => [a.attr_code, a.attr_name]));
-  const mappings = platform.prepare("SELECT * FROM bm_mapping WHERE concept_code=? AND status='ACTIVE'").all(code);
+  const mappings = await platform.prepare("SELECT * FROM bm_mapping WHERE concept_code=? AND status='ACTIVE'").all(code);
   const byTable = new Map();
   for (const m of mappings) {
     const key = `${m.ds_code}@${m.table_name}`;
@@ -262,13 +267,13 @@ R.get('/instance/:conceptCode', (req, res) => {
   const out = [];
   let p = Math.max(1, parseInt(pageNum, 10)), s = Math.min(100, Math.max(1, parseInt(pageSize, 10)));
   for (const src of sources) {
-    let db; try { db = businessDb(src.dsCode); } catch { continue; }
+    let db; try { db = await businessDb(src.dsCode); } catch { continue; }
     const cols = src.cols;
     const colSql = cols.map(c => c.column_name).join(', ');
-    const total = db.prepare(`SELECT COUNT(*) c FROM ${src.tableName}`).get().c;
+    const total = (await db.prepare(`SELECT COUNT(*) c FROM ${src.tableName}`).get()).c;
     const wantPage = !tableName || tableName === src.tableName;
     const sql = `SELECT ${colSql} FROM ${src.tableName}` + (wantPage ? ' LIMIT ? OFFSET ?' : ' LIMIT 5');
-    const rows = wantPage ? db.prepare(sql).all(s, (p - 1) * s) : db.prepare(sql).all();
+    const rows = wantPage ? await db.prepare(sql).all(s, (p - 1) * s) : await db.prepare(sql).all();
     const instances = rows.map(r => {
       const inst = {};
       for (const m of cols) {

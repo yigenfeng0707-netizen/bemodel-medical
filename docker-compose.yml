@@ -1,0 +1,46 @@
+services:
+  bemodel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bemodel:latest
+    container_name: bemodel
+    ports:
+      - "${PORT:-7860}:7860"
+    environment:
+      # ---------- 运行环境 ----------
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 7860
+      HOST: 0.0.0.0
+      # ---------- 密钥（生产必填，缺失后端拒绝启动） ----------
+      JWT_SECRET: ${JWT_SECRET:?需要设置 JWT_SECRET}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:?需要设置 APP_SECRET_KEY}
+      MCP_API_KEY: ${MCP_API_KEY:-}
+      # ---------- PostgreSQL（容器内自装；换阿里云 RDS 时指向外部） ----------
+      PG_HOST: ${PG_HOST:-127.0.0.1}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-bemodel}
+      PG_PASSWORD: ${PG_PASSWORD:-bemodel}
+      PG_PLATFORM_DB: ${PG_PLATFORM_DB:-bemodel_platform}
+      PG_DATA: /var/lib/postgresql/data
+      # ---------- LLM 网关 ----------
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      LLM_BACKUP_BASE_URL: ${LLM_BACKUP_BASE_URL:-}
+      LLM_BACKUP_API_KEY: ${LLM_BACKUP_API_KEY:-}
+      LLM_BACKUP_MODEL: ${LLM_BACKUP_MODEL:-}
+      # ---------- 向量化 ----------
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://localhost:11434/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      # ---------- 前端静态资源 ----------
+      WEB_DIST: /app/web/dist
+      # ---------- 跨域 ----------
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    volumes:
+      - bemodel-pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  bemodel-pgdata:

@@ -29,16 +29,16 @@ function endpoints() {
 }
 export function llmEnabled() { return endpoints().some(e => e.apiKey); }
 
-export function currentTag() {
-  const r = platform.prepare('SELECT version_tag FROM bm_release ORDER BY id DESC LIMIT 1').get();
+export async function currentTag() {
+  const r = await platform.prepare('SELECT version_tag FROM bm_release ORDER BY id DESC LIMIT 1').get();
   return r ? r.version_tag : '未发布';
 }
 
-function logLlm(callType, provider, model, prompts, latencyMs, success, errMsg) {
+async function logLlm(callType, provider, model, prompts, latencyMs, success, errMsg) {
   try {
-    platform.prepare(`INSERT INTO bm_llm_log(call_type, provider, model, ontology_version, prompt_digest, latency_ms, success, err_msg, created_at)
+    await platform.prepare(`INSERT INTO bm_llm_log(call_type, provider, model, ontology_version, prompt_digest, latency_ms, success, err_msg, created_at)
       VALUES (?,?,?,?,?,?,?,?,?)`).run(
-      callType, provider, model, currentTag(),
+      callType, provider, model, await currentTag(),
       (prompts.system + ' | ' + prompts.user).slice(0, 200), latencyMs, success ? 1 : 0, errMsg || null, now());
   } catch { /* 审计失败不影响主流程 */ }
 }
@@ -87,12 +87,12 @@ export async function chat(callType, systemPrompt, userPrompt) {
       try {
         const content = await attempt(ep, systemPrompt, userPrompt, Math.max(8000, timeoutMs - (Date.now() - started)), maxTokens);
         c.recordSuccess();
-        logLlm(callType, ep.name, ep.model, { system: systemPrompt, user: userPrompt }, Date.now() - started, true, null);
+        await logLlm(callType, ep.name, ep.model, { system: systemPrompt, user: userPrompt }, Date.now() - started, true, null);
         return content;
       } catch (e) {
         c.recordFailure();
         const msg = String(e.message || e || e.name || 'unknown').slice(0, 500);
-        logLlm(callType, ep.name, ep.model, { system: systemPrompt, user: userPrompt }, Date.now() - started, false, msg);
+        await logLlm(callType, ep.name, ep.model, { system: systemPrompt, user: userPrompt }, Date.now() - started, false, msg);
         const rateLimited = /429|rate|quota|exhausted|tpm|rpm/i.test(msg);
         if (rateLimited && attemptNo === 0 && Date.now() - started < timeoutMs) {
           await new Promise(s => setTimeout(s, 20000));
@@ -139,22 +139,23 @@ export function parseJsonLoose(text) {
 
 // ---------- 审计查询端点 ----------
 export const llmRouter = express.Router();
-llmRouter.get('/log/list', (req, res) => {
+llmRouter.get('/log/list', async (req, res) => {
   const pageNum = Math.max(1, parseInt(req.query.pageNum || '1', 10));
   const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize || '20', 10)));
-  const total = platform.prepare('SELECT COUNT(*) c FROM bm_llm_log').get().c;
-  const list = platform.prepare('SELECT * FROM bm_llm_log ORDER BY id DESC LIMIT ? OFFSET ?').all(pageSize, (pageNum - 1) * pageSize);
-  res.json(ok({ list, total, pageNum, pageSize }));
+  const total = await platform.prepare('SELECT COUNT(*) c FROM bm_llm_log').get();
+  const c = total?.c ?? 0;
+  const list = await platform.prepare('SELECT * FROM bm_llm_log ORDER BY id DESC LIMIT ? OFFSET ?').all(pageSize, (pageNum - 1) * pageSize);
+  res.json(ok({ list, total: c, pageNum, pageSize }));
 });
-llmRouter.get('/stats', (req, res) => {
-  const total = platform.prepare('SELECT COUNT(*) c FROM bm_llm_log').get().c;
-  const success = platform.prepare('SELECT COUNT(*) c FROM bm_llm_log WHERE success=1').get().c;
-  const avg = platform.prepare('SELECT AVG(latency_ms) a FROM bm_llm_log').get().a;
+llmRouter.get('/stats', async (req, res) => {
+  const total = await platform.prepare('SELECT COUNT(*) c FROM bm_llm_log').get();
+  const success = await platform.prepare('SELECT COUNT(*) c FROM bm_llm_log WHERE success=1').get();
+  const avg = await platform.prepare('SELECT AVG(latency_ms) a FROM bm_llm_log').get();
   const byType = {};
-  for (const r of platform.prepare('SELECT call_type t, COUNT(*) c FROM bm_llm_log GROUP BY call_type').all()) byType[r.t] = r.c;
-  res.json(ok({ total, successRate: total ? Math.round(100 * success / total) : 0, avgLatencyMs: avg ? Math.round(avg) : 0, byType, currentOntologyVersion: currentTag() }));
+  for (const r of await platform.prepare('SELECT call_type t, COUNT(*) c FROM bm_llm_log GROUP BY call_type').all()) byType[r.t] = r.c;
+  res.json(ok({ total: total?.c ?? 0, successRate: (total?.c || 0) ? Math.round(100 * (success?.c || 0) / total.c) : 0, avgLatencyMs: avg?.a ? Math.round(avg.a) : 0, byType, currentOntologyVersion: await currentTag() }));
 });
-llmRouter.get('/routes', (req, res) => {
+llmRouter.get('/routes', async (req, res) => {
   const eps = endpoints();
   res.json(ok(eps.map(e => ({
     name: e.name, model: e.model,

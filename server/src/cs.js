@@ -31,7 +31,7 @@ function routeByRule(q) {
   return null;
 }
 async function routeAsk(q, scene) {
-  const feedbacks = platform.prepare('SELECT question, intent, comment FROM bm_cs_feedback WHERE correct=0 ORDER BY id DESC LIMIT 10').all();
+  const feedbacks = await platform.prepare('SELECT question, intent, comment FROM bm_cs_feedback WHERE correct=0 ORDER BY id DESC LIMIT 10').all();
   const feedbackText = feedbacks.length
     ? `\n\n【用户纠错反馈（避免再次误判）】\n${feedbacks.map(f => `- 「${f.question}」曾被误判为 ${f.intent}${f.comment ? `（正确说法：${f.comment}）` : ''}`).join('\n')}` : '';
   if (scene === 'ANALYTICS') {
@@ -60,10 +60,11 @@ function capabilityMenu(q) {
     links: [{ label: '去智能问数', route: `/ask?q=${encodeURIComponent(q)}` }, { label: '看统一口径', route: '/glossary' }],
   };
 }
-function analyticsMenu(q) {
+async function analyticsMenu(q) {
+  const count = await platform.prepare("SELECT COUNT(*) c FROM bm_concept WHERE status='PUBLISHED'").get();
   return {
     intent: null, router: 'REFERRAL',
-    answer: `语义层已发布概念 ${platform.prepare("SELECT COUNT(*) c FROM bm_concept WHERE status='PUBLISHED'").get().c} 个。你可以问：出院多少人、检验撤销率、均次费用等；复杂业务问题请转 AI 客服。`,
+    answer: `语义层已发布概念 ${count.c} 个。你可以问：出院多少人、检验撤销率、均次费用等；复杂业务问题请转 AI 客服。`,
     links: [{ label: '去 AI 客服', route: `/cs?q=${encodeURIComponent(q)}` }],
   };
 }
@@ -82,11 +83,11 @@ function cjkBigrams(s) {
   }
   return out;
 }
-function prefilterMetricCards(q) {
+async function prefilterMetricCards(q) {
   const qb = cjkBigrams(q);
   if (!qb.length) return [];
   const cards = [];
-  for (const m of listProbed()) {
+  for (const m of await listProbed()) {
     const tb = cjkBigrams(`${m.name} ${m.definition || ''}`);
     const overlap = qb.filter(b => tb.includes(b)).length;
     if (overlap >= 2) cards.push(m);
@@ -96,21 +97,21 @@ function prefilterMetricCards(q) {
 }
 async function glossaryAnswer(q, scene, recordMissFlag = true, allowCard = true) {
   // 指标直命中 → 口径卡
-  const metric = platform.prepare('SELECT * FROM bm_metric WHERE name=? OR metric_code=?').get(q.trim(), q.trim());
+  const metric = await platform.prepare('SELECT * FROM bm_metric WHERE name=? OR metric_code=?').get(q.trim(), q.trim());
   if (metric) return metricCardAnswer(metric, scene);
   if (allowCard) {
-    const scored = prefilterMetricCards(q)
+    const scored = (await prefilterMetricCards(q))
       .map(m => ({ m, overlap: cjkBigrams(q).filter(b => cjkBigrams(`${m.name} ${m.definition || ''}`).includes(b)).length }))
       .sort((a, b) => b.overlap - a.overlap);
     if (scored.length && q.includes(scored[0].m.name)) return metricCardAnswer(scored[0].m, scene);
   }
   // 术语/概念命中
-  const term = platform.prepare('SELECT t.*, c.name AS concept_name, c.definition AS concept_def, c.code AS concept_code FROM bm_term t JOIN bm_concept c ON c.code=t.concept_code WHERE t.term=?').get(q.trim());
-  const concept = term ? null : platform.prepare('SELECT * FROM bm_concept WHERE name=? OR code=?').get(q.trim(), q.trim());
+  const term = await platform.prepare('SELECT t.*, c.name AS concept_name, c.definition AS concept_def, c.code AS concept_code FROM bm_term t JOIN bm_concept c ON c.code=t.concept_code WHERE t.term=?').get(q.trim());
+  const concept = term ? null : await platform.prepare('SELECT * FROM bm_concept WHERE name=? OR code=?').get(q.trim(), q.trim());
   if (term || concept) {
     const c = term || concept;
     const code = term ? term.concept_code : concept.code;
-    const rels = platform.prepare('SELECT * FROM bm_relation WHERE from_concept=? OR to_concept=?').all(code, code);
+    const rels = await platform.prepare('SELECT * FROM bm_relation WHERE from_concept=? OR to_concept=?').all(code, code);
     const llm = await chat('SEARCH_ANSWER', '你是口径解答助手。严格基于给定定义回答，200字以内，不要编造。',
       `术语：「${term ? term.term : concept.name}」→ 概念 ${code}（${term ? term.concept_name : concept.name}）\n定义：${term ? term.concept_def : concept.definition}\n关联关系：${rels.map(r => `${r.from_concept} —${r.relation_name}→ ${r.to_concept}`).join('；') || '无'}\n\n问题：「${q}」`);
     return {
@@ -123,9 +124,9 @@ async function glossaryAnswer(q, scene, recordMissFlag = true, allowCard = true)
   if (recordMissFlag) recordMiss(q.trim().slice(0, 64), 'CONCEPT', scene === 'CS' ? 'CS_ASK' : 'QA_ASK');
   return null;
 }
-function metricCardAnswer(m, scene) {
-  const evaled = evaluateMetric(m.metric_code);
-  const group = platform.prepare("SELECT group_code, dispute_status, verdict FROM bm_reconcile_group WHERE ',' || metric_codes || ',' LIKE ?").get(`%,${m.metric_code},%`);
+async function metricCardAnswer(m, scene) {
+  const evaled = await evaluateMetric(m.metric_code);
+  const group = await platform.prepare("SELECT group_code, dispute_status, verdict FROM bm_reconcile_group WHERE ',' || metric_codes || ',' LIKE ?").get(`%,${m.metric_code},%`);
   return {
     intent: 'GLOSSARY', router: scene === 'CS' ? 'SEMANTIC' : 'RULE',
     answer: `【口径卡】${m.name}（${m.metric_code}）：${m.definition || '（无定义）'}`,
@@ -144,30 +145,35 @@ function metricCardAnswer(m, scene) {
 // 跨库核对：六语义档（专家预定义，LLM 不参与判定）
 // ============================================================
 const NIGHTLY_END_HOUR = 6;
-export function reconcileDispensePay() {
+export async function reconcileDispensePay() {
   const runId = `RECON-${now().replace(/[-: ]/g, '')}-${Math.random().toString(36).slice(2, 8)}`;
   const tiers = [];
   const diffs = [];
   const usedOrders = new Set();
-  const push = (direction, stateCode, rows, note) => {
+  const push = async (direction, stateCode, rows, note) => {
     const t = TIERS[stateCode];
-    tiers.push({ direction, stateCode, severity: t.severity, attribution: attributionOf(stateCode), suggestedAction: t.action, count: rows.length, note });
-    for (const r of rows) diffs.push({ runId, direction, stateCode, severity: t.severity, attribution: attributionOf(stateCode), suggestedAction: t.action, ...r });
+    const attribution = await attributionOf(stateCode);
+    tiers.push({ direction, stateCode, severity: t.severity, attribution, suggestedAction: t.action, count: rows.length, note });
+    for (const r of rows) diffs.push({ runId, direction, stateCode, severity: t.severity, attribution, suggestedAction: t.action, ...r });
   };
-  const his = businessDb('DS_HIS'), ph = businessDb('DS_PHARMACY'), charge = businessDb('DS_CHARGE');
+  const his = await businessDb('DS_HIS'), ph = await businessDb('DS_PHARMACY'), charge = await businessDb('DS_CHARGE');
   // A 向：已发药但患者无任何有效缴费
-  const paid = new Set(charge.prepare("SELECT DISTINCT inhos_no FROM pay_record WHERE pay_type IN ('1','2','4')").all().map(r => r.inhos_no));
-  const dispensed = ph.prepare("SELECT dispense_id, order_id, patient_no, item_name FROM dispense_record WHERE status='1'").all();
-  push('A', 'VIOLATION_PREPAY_BYPASS', dispensed.filter(r => !paid.has(r.patient_no)));
+  const paidRows = await charge.prepare("SELECT DISTINCT inhos_no FROM pay_record WHERE pay_type IN ('1','2','4')").all();
+  const paid = new Set(paidRows.map(r => r.inhos_no));
+  const dispensed = await ph.prepare("SELECT dispense_id, order_id, patient_no, item_name FROM dispense_record WHERE status='1'").all();
+  await push('A', 'VIOLATION_PREPAY_BYPASS', dispensed.filter(r => !paid.has(r.patient_no)));
   // A 向：已退药但费用未退费
-  const refundedOrders = new Set(his.prepare("SELECT order_id FROM fee_detail WHERE fee_status='2'").all().map(r => r.order_id));
-  const returned = ph.prepare("SELECT dispense_id, order_id, patient_no, item_name FROM dispense_record WHERE status='2'").all()
+  const refundedRows = await his.prepare("SELECT order_id FROM fee_detail WHERE fee_status='2'").all();
+  const refundedOrders = new Set(refundedRows.map(r => r.order_id));
+  const returnedRows = await ph.prepare("SELECT dispense_id, order_id, patient_no, item_name FROM dispense_record WHERE status='2'").all();
+  const returned = returnedRows
     .filter(r => !refundedOrders.has(r.order_id));
   for (const r of returned) usedOrders.add(r.order_id);
-  push('A', 'RETURNED_PENDING_REFUND', returned);
+  await push('A', 'RETURNED_PENDING_REFUND', returned);
   // B 向：药品医嘱 × 费用 × 发药
-  const dispensedOrders = new Set(ph.prepare("SELECT DISTINCT order_id FROM dispense_record WHERE status IN ('0','1')").all().map(r => r.order_id));
-  const bRows = his.prepare(`SELECT o.order_id, o.inhos_no, o.item_name, o.order_status, o.cancel_time, f.fee_status
+  const dispenseOrderRows = await ph.prepare("SELECT DISTINCT order_id FROM dispense_record WHERE status IN ('0','1')").all();
+  const dispensedOrders = new Set(dispenseOrderRows.map(r => r.order_id));
+  const bRows = await his.prepare(`SELECT o.order_id, o.inhos_no, o.item_name, o.order_status, o.cancel_time, f.fee_status
     FROM medical_order o JOIN fee_detail f ON f.order_id=o.order_id WHERE o.order_type='药品'`).all();
   const stuck = [], inflight = [], cancelledAfter = [], nightly = [];
   for (const r of bRows) {
@@ -180,14 +186,14 @@ export function reconcileDispensePay() {
       if (r.fee_status === '1') cancelledAfter.push(r);
     }
   }
-  push('B', 'STUCK_BACKLOG', stuck);
-  push('B', 'IN_FLIGHT', inflight);
-  push('B', 'CANCELLED_AFTER_PAY', cancelledAfter);
-  push('B', 'NIGHTLY_CANCEL', nightly);
+  await push('B', 'STUCK_BACKLOG', stuck);
+  await push('B', 'IN_FLIGHT', inflight);
+  await push('B', 'CANCELLED_AFTER_PAY', cancelledAfter);
+  await push('B', 'NIGHTLY_CANCEL', nightly);
   // 落库 + 清理 7 天前旧批次
-  const ins = platform.prepare('INSERT INTO bm_recon_diff(run_id,direction,state_code,severity,attribution,suggested_action,patient_no,order_id,item_name) VALUES (?,?,?,?,?,?,?,?,?)');
-  for (const d of diffs) ins.run(d.runId, d.direction, d.stateCode, d.severity, d.attribution, d.suggestedAction, d.patient_no || d.inhos_no || null, d.order_id || null, d.item_name || null);
-  platform.prepare(`DELETE FROM bm_recon_diff WHERE created_at < datetime('now','localtime','-7 days')`).run();
+  for (const d of diffs) await platform.prepare('INSERT INTO bm_recon_diff(run_id,direction,state_code,severity,attribution,suggested_action,patient_no,order_id,item_name) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(d.runId, d.direction, d.stateCode, d.severity, d.attribution, d.suggestedAction, d.patient_no || d.inhos_no || null, d.order_id || null, d.item_name || null);
+  await platform.prepare(`DELETE FROM bm_recon_diff WHERE created_at < NOW() - INTERVAL '7 days'`).run();
   const abnormalCount = diffs.filter(d => !['IN_FLIGHT', 'NIGHTLY_CANCEL'].includes(d.stateCode)).length;
   return { runId, tiers, diffs, registered: diffs.length, abnormalCount };
 }
@@ -199,8 +205,8 @@ const TIERS = {
   CANCELLED_AFTER_PAY: { severity: 'WATCH', action: '人工核对退费是否完成' },
   NIGHTLY_CANCEL: { severity: 'NORMAL', action: '归因消除，不进异常清单' },
 };
-function attributionOf(stateCode) {
-  const fromKb = entryContent(`RECON_ATTR_${stateCode}`);
+async function attributionOf(stateCode) {
+  const fromKb = await entryContent(`RECON_ATTR_${stateCode}`);
   if (fromKb) return fromKb.split('。')[0] + '。';
   return {
     VIOLATION_PREPAY_BYPASS: '已发药但患者无任何有效缴费记录，先药后费违反流程公理。',
@@ -215,10 +221,11 @@ function attributionOf(stateCode) {
 // ============================================================
 // 各意图回答
 // ============================================================
-function feeAnswer() {
-  const row = businessDb('DS_HIS').prepare(`SELECT COUNT(DISTINCT f.inhos_no) patient_cnt, COUNT(*) fee_cnt, CAST(SUM(f.amount) AS INTEGER) total_amount
+async function feeAnswer() {
+  const his = await businessDb('DS_HIS');
+  const row = await his.prepare(`SELECT COUNT(DISTINCT f.inhos_no) patient_cnt, COUNT(*) fee_cnt, CAST(SUM(f.amount) AS INTEGER) total_amount
     FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id WHERE o.order_status='2' AND f.fee_status='1'`).get();
-  const rootCause = entryContent('CS_RULE_FEE_ROOT') || 'LIS v5.2 升级后撤销码 X→C，HIS 计费适配器未同步配置 C 码退费映射。';
+  const rootCause = await entryContent('CS_RULE_FEE_ROOT') || 'LIS v5.2 升级后撤销码 X→C，HIS 计费适配器未同步配置 C 码退费映射。';
   return {
     intent: 'FEE', router: 'SEMANTIC',
     answer: `经排查，全院共有 ${row.patient_cnt} 名患者、${row.fee_cnt} 笔「医嘱已取消但费用仍正常计费」记录，合计 ¥${row.total_amount}。根因：${rootCause} 已生成根因分析并支持一键处置退费。`,
@@ -226,8 +233,9 @@ function feeAnswer() {
     links: [{ label: '去工单诊断', route: '/cs' }, { label: '看数据治理', route: '/gov' }],
   };
 }
-function dispenseSplitAnswer() {
-  const rows = businessDb('DS_PHARMACY').prepare(`SELECT order_id, COUNT(*) cnt FROM dispense_record GROUP BY order_id HAVING COUNT(*) > 1 LIMIT 10`).all();
+async function dispenseSplitAnswer() {
+  const ph = await businessDb('DS_PHARMACY');
+  const rows = await ph.prepare(`SELECT order_id, COUNT(*) cnt FROM dispense_record GROUP BY order_id HAVING COUNT(*) > 1 LIMIT 10`).all();
   return {
     intent: 'DISPENSE_SPLIT', router: 'SEMANTIC',
     answer: rows.length
@@ -237,9 +245,13 @@ function dispenseSplitAnswer() {
     links: [{ label: '去链路追溯', route: '/link' }],
   };
 }
-function dispenseReturnAnswer() {
-  const returned = businessDb('DS_PHARMACY').prepare("SELECT COUNT(*) c FROM dispense_record WHERE status='2'").get().c;
-  const refunded = businessDb('DS_HIS').prepare("SELECT COUNT(*) c FROM fee_detail WHERE fee_status='2'").get().c;
+async function dispenseReturnAnswer() {
+  const ph = await businessDb('DS_PHARMACY');
+  const returnedRow = await ph.prepare("SELECT COUNT(*) c FROM dispense_record WHERE status='2'").get();
+  const his = await businessDb('DS_HIS');
+  const refundedRow = await his.prepare("SELECT COUNT(*) c FROM fee_detail WHERE fee_status='2'").get();
+  const returned = returnedRow.c;
+  const refunded = refundedRow.c;
   return {
     intent: 'DISPENSE_RETURN', router: 'SEMANTIC',
     answer: `已退药记录 ${returned} 条；已退费费用 ${refunded} 条。退药与退费必须成对（先退药后退费），差异部分走跨库核对六档语义定位。`,
@@ -247,9 +259,13 @@ function dispenseReturnAnswer() {
     links: [{ label: '跨库核对差异', route: '/cs' }],
   };
 }
-function materialAnswer() {
-  const low = businessDb('DS_PHARMACY').prepare('SELECT COUNT(*) c FROM drug_stock WHERE quantity<=50').get().c;
-  const mats = businessDb('DS_MATERIAL').prepare('SELECT COUNT(*) c FROM material_stock WHERE quantity < 100').get().c;
+async function materialAnswer() {
+  const ph = await businessDb('DS_PHARMACY');
+  const lowRow = await ph.prepare('SELECT COUNT(*) c FROM drug_stock WHERE quantity<=50').get();
+  const mat = await businessDb('DS_MATERIAL');
+  const matsRow = await mat.prepare('SELECT COUNT(*) c FROM material_stock WHERE quantity < 100').get();
+  const low = lowRow.c;
+  const mats = matsRow.c;
   return {
     intent: 'MATERIAL', router: 'SEMANTIC',
     answer: `药品库存：低库存（≤50）药品 ${low} 种；物资库存：低于 100 的物资 ${mats} 种。库存账实规则（GOV-007/011）可一键核验。`,
@@ -257,14 +273,15 @@ function materialAnswer() {
     links: [{ label: '数据治理扫描', route: '/gov' }, { label: '推演沙盘', route: '/simulation' }],
   };
 }
-function staffAnswer(q) {
+async function staffAnswer(q) {
   const name = (q.match(/([\u4e00-\u9fa5]{2,3})(?:医生|护士|药师|的)?/) || [])[1] || '';
-  const staff = businessDb('DS_HIS').prepare('SELECT * FROM staff WHERE staff_name LIKE ?').all(`%${name.slice(-2)}%`);
+  const his = await businessDb('DS_HIS');
+  const staff = await his.prepare('SELECT * FROM staff WHERE staff_name LIKE ?').all(`%${name.slice(-2)}%`);
   if (!staff.length) {
     return { intent: 'STAFF', router: 'SEMANTIC', answer: `未在人员主数据中找到「${name}」，主数据覆盖缺口，建议补录。`, evidence: [], links: [] };
   }
   const s = staff[0];
-  const dept = businessDb('DS_HIS').prepare('SELECT * FROM dept WHERE dept_code=?').get(s.dept_code);
+  const dept = await his.prepare('SELECT * FROM dept WHERE dept_code=?').get(s.dept_code);
   return {
     intent: 'STAFF', router: 'SEMANTIC',
     answer: `${s.staff_name}（${s.staff_id}）：${s.title}，${s.role}，所属「${dept?.dept_name || s.dept_code}」${dept ? `（${dept.ward || dept.category}）` : ''}。可下钻查看跨系统业务足迹。`,
@@ -290,8 +307,8 @@ async function docQaAnswer(q) {
   };
 }
 async function semanticModelAnswer(q) {
-  const concepts = platform.prepare("SELECT c.code, c.name, c.definition, c.domain_code FROM bm_concept c WHERE c.status='PUBLISHED' ORDER BY c.code").all();
-  const rels = platform.prepare('SELECT * FROM bm_relation').all();
+  const concepts = await platform.prepare("SELECT c.code, c.name, c.definition, c.domain_code FROM bm_concept c WHERE c.status='PUBLISHED' ORDER BY c.code").all();
+  const rels = await platform.prepare('SELECT * FROM bm_relation').all();
   const llm = await chat('CS_SEMANTIC_PLAN',
     '你是本体语义推理器。基于本体结构回答业务规则问题，只返回 JSON。',
     `【本体概念】${concepts.map(c => `${c.code}(${c.name})：${c.definition || ''}`).join('；')}\n【概念关系】${rels.map(r => `${r.from_concept} —${r.relation_name}→ ${r.to_concept}`).join('；')}\n\n问题：「${q}」\n按本体结构与已发布动作推理，返回 {"mode":"MODEL_ANSWER","conclusion":"可以/不可以/…","semantics":"推理依据（引用概念与关系）"}。`);
@@ -315,15 +332,17 @@ async function semanticModelAnswer(q) {
 // 语义问数（ANALYTICS：Ontology2SQL）
 // ============================================================
 function sceneDsList() { return config.semanticSceneDs; }
-function buildSemanticContext() {
+async function buildSemanticContext() {
   const scene = sceneDsList();
-  const concepts = platform.prepare("SELECT code, name, definition FROM bm_concept WHERE status='PUBLISHED' ORDER BY code").all()
-    .map(c => {
-      const attrs = platform.prepare('SELECT attr_code, attr_name, data_type FROM bm_attribute WHERE concept_code=? ORDER BY sort').all(c.code);
-      return `${c.code}(${c.name})：${attrs.map(a => `${a.attr_code}[${a.data_type}]`).join(',')}`;
-    }).join('\n');
-  const rels = platform.prepare('SELECT * FROM bm_relation').all().map(r => `${r.from_concept} —${r.relation_name}→ ${r.to_concept}`).join('；');
-  const mappings = platform.prepare(`SELECT * FROM bm_mapping WHERE status='ACTIVE' AND ds_code IN (${scene.map(() => '?').join(',')}) ORDER BY ds_code, table_name`).all(...scene);
+  const conceptRows = await platform.prepare("SELECT code, name, definition FROM bm_concept WHERE status='PUBLISHED' ORDER BY code").all();
+  const conceptParts = [];
+  for (const c of conceptRows) {
+    const attrs = await platform.prepare('SELECT attr_code, attr_name, data_type FROM bm_attribute WHERE concept_code=? ORDER BY sort').all(c.code);
+    conceptParts.push(`${c.code}(${c.name})：${attrs.map(a => `${a.attr_code}[${a.data_type}]`).join(',')}`);
+  }
+  const concepts = conceptParts.join('\n');
+  const rels = (await platform.prepare('SELECT * FROM bm_relation').all()).map(r => `${r.from_concept} —${r.relation_name}→ ${r.to_concept}`).join('；');
+  const mappings = await platform.prepare(`SELECT * FROM bm_mapping WHERE status='ACTIVE' AND ds_code IN (${scene.map(() => '?').join(',')}) ORDER BY ds_code, table_name`).all(...scene);
   const byDs = new Map();
   for (const m of mappings) {
     const k = m.ds_code;
@@ -342,16 +361,16 @@ function buildSemanticContext() {
   if (!phys) phys = '（场景内数据源暂无生效映射：查数类问题回答不了，按规则返回 UNANSWERABLE，严禁编造数据源或表名）';
   return { concepts, rels, phys };
 }
-function allowedTablesCols(ds) {
-  const rows = platform.prepare("SELECT * FROM bm_mapping WHERE status='ACTIVE' AND ds_code=?").all(ds);
+async function allowedTablesCols(ds) {
+  const rows = await platform.prepare("SELECT * FROM bm_mapping WHERE status='ACTIVE' AND ds_code=?").all(ds);
   return {
     tables: [...new Set(rows.map(r => r.table_name))],
     cols: [...new Set(rows.map(r => r.column_name).concat(rows.map(r => r.attr_code)))].filter(Boolean),
   };
 }
-function persistQaTrace(scene, q, plan, rows, answer, answerSource, durationMs, extra = {}) {
+async function persistQaTrace(scene, q, plan, rows, answer, answerSource, durationMs, extra = {}) {
   const traceId = `QA-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-  platform.prepare(`INSERT INTO bm_qa_trace(trace_id,scene,question,ds_code,used_tables,sql_text,semantics,matched_concepts,matched_docs,plan_mode,row_count,answer,answer_source,duration_ms)
+  await platform.prepare(`INSERT INTO bm_qa_trace(trace_id,scene,question,ds_code,used_tables,sql_text,semantics,matched_concepts,matched_docs,plan_mode,row_count,answer,answer_source,duration_ms)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     traceId, scene, q, plan.ds || null, plan.usedTables || null, plan.sql || null, plan.semantics || null,
     (extra.matchedConcepts || []).join(',') || null, (extra.matchedDocs || []).join(',') || null,
@@ -362,13 +381,13 @@ function persistQaTrace(scene, q, plan, rows, answer, answerSource, durationMs, 
 
 async function planQuery(q, scene) {
   const started = Date.now();
-  const ctx = buildSemanticContext();
-  const cards = prefilterMetricCards(q);
+  const ctx = await buildSemanticContext();
+  const cards = await prefilterMetricCards(q);
   const cardText = cards.length ? `\n【在册口径卡】${cards.map(m => `${m.metric_code}(${m.name})：${m.definition}`).join('；')}` : '';
   const today = now().slice(0, 10);
   const llm = await chat('CS_SEMANTIC_PLAN',
     '你是本体语义查询规划器。把自然语言转换为只读 SQL 或结构化计划，只返回 JSON，不要多余文字。',
-    `【本体概念】\n${ctx.concepts}\n\n【物理映射（仅场景内数据源，只允许用这里的库/表/列）】\n${ctx.phys}\n\n【概念关系】${ctx.rels}${cardText}\n\n规则：\n1 ds/表/列只能取物理映射段；枚举列的中文需反解为原始码；\n2 生成以 SELECT 开头的 SQLite 只读 SQL，末尾 LIMIT≤100；日期用 strftime；\n3 今天是 ${today}；\n4 问口径/定义 → mode=GLOSSARY 类问题直接给 metrics 或走 GLOSSARY；问题恰是某口径卡所指指标本身（不带科室/时段限定）→ mode=METRIC 并返回 metrics:["指标编码"]；\n5 业务规则/能不能类问题 → mode=MODEL_ANSWER；\n6 答不了（信息不足=AMBIGUITY，词表没有=VOCABULARY；平台故障=VOCABULARY）→ mode=UNANSWERABLE 并给 gapType 与 reason；\n7 QUERY 模式返回 {"mode":"QUERY","ds":"数据源编码","sql":"...","semantics":"查询逻辑说明"}。\n\n问题：「${q}」`);
+    `【本体概念】\n${ctx.concepts}\n\n【物理映射（仅场景内数据源，只允许用这里的库/表/列）】\n${ctx.phys}\n\n【概念关系】${ctx.rels}${cardText}\n\n规则：\n1 ds/表/列只能取物理映射段；枚举列的中文需反解为原始码；\n2 生成以 SELECT 开头的 PostgreSQL 只读 SQL，末尾 LIMIT≤100；日期用 to_char/EXTRACT；\n3 今天是 ${today}；\n4 问口径/定义 → mode=GLOSSARY 类问题直接给 metrics 或走 GLOSSARY；问题恰是某口径卡所指指标本身（不带科室/时段限定）→ mode=METRIC 并返回 metrics:["指标编码"]；\n5 业务规则/能不能类问题 → mode=MODEL_ANSWER；\n6 答不了（信息不足=AMBIGUITY，词表没有=VOCABULARY；平台故障=VOCABULARY）→ mode=UNANSWERABLE 并给 gapType 与 reason；\n7 QUERY 模式返回 {"mode":"QUERY","ds":"数据源编码","sql":"...","semantics":"查询逻辑说明"}。\n\n问题：「${q}」`);
   const p = parseJsonLoose(llm);
   if (!p || !p.mode) return null; // LLM 不可用/解析失败 → 能力菜单（非语义层缺口，不记 miss）
   return { plan: p, started };
@@ -378,43 +397,49 @@ async function executeQueryPlan(plan) {
   if (!plan.ds || !plan.sql) throw new BizException('查询计划缺少数据源或 SQL');
   const scene = sceneDsList();
   if (scene.length && !scene.includes(plan.ds)) throw new BizException(`数据源 ${plan.ds} 不在问数场景清单内`);
-  const { tables, cols } = allowedTablesCols(plan.ds);
+  const { tables, cols } = await allowedTablesCols(plan.ds);
   if (!tables.length) throw new BizException(`数据源 ${plan.ds} 无生效映射，拒绝执行`);
   const safeSql = validateSql(plan.sql, tables, cols);
-  const db = businessDb(plan.ds);
-  const rows = db.prepare(safeSql).all();
+  const db = await businessDb(plan.ds);
+  const rows = await db.prepare(safeSql).all();
   return { safeSql, rows: rows.slice(0, 100), tables };
 }
 
 export async function analyticsAsk(q) {
   // 口径前置试探：仅指标名称直命中才出卡提前返回
-  const metricHit = platform.prepare('SELECT * FROM bm_metric WHERE name=?').get(q.trim());
-  if (metricHit) return { ...metricCardAnswer(metricHit, 'ANALYTICS'), traceId: persistQaTrace('ANALYTICS', q, { mode: 'GLOSSARY' }, null, metricCardAnswer(metricHit, 'ANALYTICS').answer, 'TEMPLATE', 0) };
+  const metricHit = await platform.prepare('SELECT * FROM bm_metric WHERE name=?').get(q.trim());
+  if (metricHit) {
+    const card = await metricCardAnswer(metricHit, 'ANALYTICS');
+    const traceId = await persistQaTrace('ANALYTICS', q, { mode: 'GLOSSARY' }, null, card.answer, 'TEMPLATE', 0);
+    return { ...card, traceId };
+  }
   const planned = await planQuery(q, 'ANALYTICS');
   if (!planned) {
     // LLM 不可用：规则兜底——口径卡直命中（router=RULE，诚实标注）
-    const cards = prefilterMetricCards(q).filter(m => q.includes(m.name.slice(0, Math.max(2, m.name.length - 1))) || m.name.includes(q.slice(0, 6)));
+    const cards = (await prefilterMetricCards(q)).filter(m => q.includes(m.name.slice(0, Math.max(2, m.name.length - 1))) || m.name.includes(q.slice(0, 6)));
     if (cards.length) {
       const m = cards[0];
-      const a = metricCardAnswer(m, 'ANALYTICS');
-      return { ...a, router: 'RULE', ruleFallback: true, traceId: persistQaTrace('ANALYTICS', q, { mode: 'GLOSSARY' }, null, a.answer, 'TEMPLATE', 0) };
+      const a = await metricCardAnswer(m, 'ANALYTICS');
+      const traceId = await persistQaTrace('ANALYTICS', q, { mode: 'GLOSSARY' }, null, a.answer, 'TEMPLATE', 0);
+      return { ...a, router: 'RULE', ruleFallback: true, traceId };
     }
-    return { ...analyticsMenu(q), parseEmpty: true };
+    return { ...await analyticsMenu(q), parseEmpty: true };
   }
   const { plan } = planned;
   const duration = Date.now() - planned.started;
 
   if (plan.mode === 'METRIC') {
     const codes = Array.isArray(plan.metrics) ? plan.metrics : [];
-    const cards = (codes.length ? codes.map(c => getMetric(c)).filter(Boolean) : prefilterMetricCards(q)).slice(0, 5);
-    if (!cards.length) return { ...analyticsMenu(q), parseEmpty: true };
-    const results = cards.map(m => {
-      const ev = evaluateMetric(m.metric_code);
-      const group = platform.prepare("SELECT group_code, dispute_status FROM bm_reconcile_group WHERE ',' || metric_codes || ',' LIKE ?").get(`%,${m.metric_code},%`);
-      return { metricCode: m.metric_code, name: m.name, definition: m.definition, formula: m.formula, dsCode: m.ds_code, probeSql: m.probe_sql, owner: m.owner, warnThreshold: m.warn_threshold, lastVal: ev.value, error: ev.error || null, reconciled: group || null };
-    });
+    const cards = (codes.length ? (await Promise.all(codes.map(c => getMetric(c)))).filter(Boolean) : await prefilterMetricCards(q)).slice(0, 5);
+    if (!cards.length) return { ...await analyticsMenu(q), parseEmpty: true };
+    const results = [];
+    for (const m of cards) {
+      const ev = await evaluateMetric(m.metric_code);
+      const group = await platform.prepare("SELECT group_code, dispute_status FROM bm_reconcile_group WHERE ',' || metric_codes || ',' LIKE ?").get(`%,${m.metric_code},%`);
+      results.push({ metricCode: m.metric_code, name: m.name, definition: m.definition, formula: m.formula, dsCode: m.ds_code, probeSql: m.probe_sql, owner: m.owner, warnThreshold: m.warn_threshold, lastVal: ev.value, error: ev.error || null, reconciled: group || null });
+    }
     const answer = results.map(r => `${r.name}: ${r.error ? `（探针失败：${r.error}）` : r.lastVal}`).join('；') + '。（口径卡实测，非现场编造）';
-    const traceId = persistQaTrace('ANALYTICS', q, { mode: 'METRIC', semantics: '口径卡探针实测' }, null, answer, 'TEMPLATE', duration);
+    const traceId = await persistQaTrace('ANALYTICS', q, { mode: 'METRIC', semantics: '口径卡探针实测' }, null, answer, 'TEMPLATE', duration);
     return { intent: 'GLOSSARY', router: 'SEMANTIC', mode: 'METRIC', answer, metricCards: results, traceId, links: [{ label: '统一口径', route: '/glossary' }] };
   }
   if (plan.mode === 'MODEL_ANSWER') {
@@ -426,7 +451,7 @@ export async function analyticsAsk(q) {
         verifyNote = `探针实证：${rows.length} 行`;
       } catch (e) { verifyNote = `探针校验未通过（${e.message}），保留结构结论`; }
     }
-    const traceId = persistQaTrace('ANALYTICS', q, { mode: 'MODEL_ANSWER', semantics: plan.semantics, sql: plan.verifySql, ds: plan.ds }, null, answer, 'TEMPLATE', duration);
+    const traceId = await persistQaTrace('ANALYTICS', q, { mode: 'MODEL_ANSWER', semantics: plan.semantics, sql: plan.verifySql, ds: plan.ds }, null, answer, 'TEMPLATE', duration);
     return {
       intent: 'SEMANTIC_QUERY', router: 'SEMANTIC', mode: 'MODEL_ANSWER', answer: answer + (verifyNote ? ` ${verifyNote}` : ''),
       semantics: plan.semantics, traceId, links: [{ label: '本体管理', route: '/ontology' }],
@@ -436,7 +461,7 @@ export async function analyticsAsk(q) {
     const gapType = plan.gapType === 'AMBIGUITY' ? 'AMBIGUITY' : 'VOCABULARY';
     if (gapType === 'AMBIGUITY') {
       const clarifyQ = plan.reason ? `需要补充信息：${plan.reason}。请补充时间范围/科室/对象/口径。` : '需要补充信息：请说明时间范围、科室或具体对象。';
-      const r = platform.prepare('INSERT INTO bm_clarify_task(scene,origin_question,reason,gap_type,clarify_question,status,rounds) VALUES (?,?,?,?,?,?,1)')
+      const r = await platform.prepare('INSERT INTO bm_clarify_task(scene,origin_question,reason,gap_type,clarify_question,status,rounds) VALUES (?,?,?,?,?,?,1)')
         .run('ANALYTICS', q, plan.reason || '', 'AMBIGUITY', clarifyQ);
       return {
         intent: 'SEMANTIC_QUERY', router: 'SEMANTIC', mode: 'UNANSWERABLE', clarify: {
@@ -460,8 +485,8 @@ export async function analyticsAsk(q) {
     const llm = await chat('CS_SEMANTIC_ANSWER', '你是数据问答助手。严格基于查询结果作答：先给结论再给关键数字，结果里没有的信息不要编造，200字以内。',
       `问题：「${q}」\n查询结果（前20行，已脱敏）：\n${JSON.stringify(masked.slice(0, 20)).slice(0, 3000)}`);
     const answer = llm || templateAnswer(q, rows);
-    const matchedConcepts = matchConcepts(q);
-    const traceId = persistQaTrace('ANALYTICS', q, { ...plan, sql: safeSql, usedTables: tables.join(',') }, rows, answer, llm ? 'LLM' : 'TEMPLATE', Date.now() - planned.started, { matchedConcepts });
+    const matchedConcepts = await matchConcepts(q);
+    const traceId = await persistQaTrace('ANALYTICS', q, { ...plan, sql: safeSql, usedTables: tables.join(',') }, rows, answer, llm ? 'LLM' : 'TEMPLATE', Date.now() - planned.started, { matchedConcepts });
     return {
       intent: 'SEMANTIC_QUERY', router: 'SEMANTIC', mode: 'QUERY', answer,
       parse: { semantics: plan.semantics, sql: safeSql, ds: plan.ds, rows: masked.slice(0, 20), rowCount: rows.length, matchedConcepts },
@@ -469,30 +494,32 @@ export async function analyticsAsk(q) {
     };
   } catch (e) {
     console.error('[SemanticQA] QUERY 执行失败:', e.message, '| ds =', plan.ds, '| sql =', plan.sql);
-    // 协议纠错一次：把 SQLite 报错回喂 LLM 修复 SQL，修复后仍失败才降级
+    // 协议纠错一次：把 PG 报错回喂 LLM 修复 SQL，修复后仍失败才降级
     try {
-      const ctx = buildSemanticContext();
+      const ctx = await buildSemanticContext();
       const fixLlm = await chat('CS_SEMANTIC_PLAN',
-        '你修复 SQLite SQL 语法错误。只返回 JSON：{"ds":"数据源","sql":"修正后的完整SQL"}。',
-        `原计划：${JSON.stringify({ ds: plan.ds, sql: plan.sql })}\n执行错误：${e.message}\n\n【可用映射（只允许用这里的库/表/列）】\n${ctx.phys}\n\n修正要求：以 SELECT 开头、SQLite 方言（日期用 strftime）、末尾 LIMIT≤100、只改 SQL 不改语义。`);
+        '你修复 PostgreSQL SQL 语法错误。只返回 JSON：{"ds":"数据源","sql":"修正后的完整SQL"}。',
+        `原计划：${JSON.stringify({ ds: plan.ds, sql: plan.sql })}\n执行错误：${e.message}\n\n【可用映射（只允许用这里的库/表/列）】\n${ctx.phys}\n\n修正要求：以 SELECT 开头、PostgreSQL 方言（日期用 to_char/EXTRACT）、末尾 LIMIT≤100、只改 SQL 不改语义。`);
       const fixed = parseJsonLoose(fixLlm);
       if (fixed?.sql && fixed?.ds) {
         const { safeSql, rows, tables } = await executeQueryPlan({ ds: fixed.ds, sql: fixed.sql });
         const masked = maskPatientRows(rows);
         const answer = templateAnswer(q, rows);
-        const traceId = persistQaTrace('ANALYTICS', q, { ...plan, sql: safeSql, usedTables: tables.join(','), semantics: (plan.semantics || '') + '（一次 SQL 修复后执行）' }, rows, answer, 'TEMPLATE', Date.now() - planned.started, { matchedConcepts: matchConcepts(q) });
+        const matchedConcepts = await matchConcepts(q);
+        const traceId = await persistQaTrace('ANALYTICS', q, { ...plan, sql: safeSql, usedTables: tables.join(','), semantics: (plan.semantics || '') + '（一次 SQL 修复后执行）' }, rows, answer, 'TEMPLATE', Date.now() - planned.started, { matchedConcepts });
         return {
           intent: 'SEMANTIC_QUERY', router: 'SEMANTIC', mode: 'QUERY', answer,
-          parse: { semantics: plan.semantics, sql: safeSql, ds: plan.ds, rows: masked.slice(0, 20), rowCount: rows.length, matchedConcepts: matchConcepts(q) },
+          parse: { semantics: plan.semantics, sql: safeSql, ds: plan.ds, rows: masked.slice(0, 20), rowCount: rows.length, matchedConcepts },
           traceId, links: [{ label: '证据链', route: `/trace?type=QA&key=${traceId}` }],
         };
       }
     } catch { /* 修复失败走下方兜底 */ }
     // 诚实兜底：现场 SQL 失败，但问题恰是某口径卡所指 → 回落口径卡实测（router=RULE）
-    const cards = prefilterMetricCards(q).filter(m => q.includes(m.name.slice(0, Math.max(2, m.name.length - 1))));
+    const cards = (await prefilterMetricCards(q)).filter(m => q.includes(m.name.slice(0, Math.max(2, m.name.length - 1))));
     if (cards.length) {
-      const a = metricCardAnswer(cards[0], 'ANALYTICS');
-      return { ...a, router: 'RULE', ruleFallback: true, traceId: persistQaTrace('ANALYTICS', q, { mode: 'GLOSSARY' }, null, a.answer, 'TEMPLATE', Date.now() - planned.started) };
+      const a = await metricCardAnswer(cards[0], 'ANALYTICS');
+      const traceId = await persistQaTrace('ANALYTICS', q, { mode: 'GLOSSARY' }, null, a.answer, 'TEMPLATE', Date.now() - planned.started);
+      return { ...a, router: 'RULE', ruleFallback: true, traceId };
     }
     recordMiss(q.trim().slice(0, 64), 'QUESTION', 'QA_ASK');
     return {
@@ -509,8 +536,9 @@ function templateAnswer(q, rows) {
   if (keys.length === 1 && nums.length === 1) return `查询结果：${rows[0][keys[0]]}${/多少|数|笔|人|量/.test(q) ? '' : ''}（共 1 行）。`;
   return `查询返回 ${rows.length} 行${nums.length ? `，${nums.map(k => `${k} 合计 ${rows.reduce((s, r) => s + (Number(r[k]) || 0), 0)}`).join('，')}` : ''}。`;
 }
-function matchConcepts(q) {
-  return platform.prepare("SELECT code, name FROM bm_concept WHERE status='PUBLISHED'").all()
+async function matchConcepts(q) {
+  const rows = await platform.prepare("SELECT code, name FROM bm_concept WHERE status='PUBLISHED'").all();
+  return rows
     .filter(c => (c.name.length >= 2 && q.includes(c.name)) || q.toUpperCase().includes(c.code))
     .slice(0, 6).map(c => c.code);
 }
@@ -520,15 +548,15 @@ function matchConcepts(q) {
 // ============================================================
 async function csAsk(q) {
   // FEE 直答（投诉诊断类）
-  const feeProbe = platform.prepare("SELECT COUNT(*) c FROM bm_cs_feedback").get();
+  const feeProbe = await platform.prepare("SELECT COUNT(*) c FROM bm_cs_feedback").get();
   void feeProbe;
-  const recon = platform.prepare('SELECT COUNT(*) c FROM link_node WHERE node_type=?').get('TICKET');
+  const recon = await platform.prepare('SELECT COUNT(*) c FROM link_node WHERE node_type=?').get('TICKET');
   void recon;
   const { intent, router } = await routeAsk(q, 'CS');
   if (!intent) return capabilityMenu(q);
-  if (intent === 'FEE') return feeAnswer();
+  if (intent === 'FEE') return await feeAnswer();
   if (intent === 'DISPENSE_PAY') {
-    const r = reconcileDispensePay();
+    const r = await reconcileDispensePay();
     const tiers = r.tiers.filter(t => t.count > 0).map(t => `${t.stateCode}:${t.count}笔（${t.severity}）`).join('；') || '无差异';
     return {
       intent, router,
@@ -538,21 +566,21 @@ async function csAsk(q) {
       links: [{ label: '查看差异明细', route: `/cs?recon=${r.runId}` }],
     };
   }
-  if (intent === 'DISPENSE_SPLIT') return dispenseSplitAnswer();
-  if (intent === 'DISPENSE_RETURN') return dispenseReturnAnswer();
-  if (intent === 'MATERIAL') return materialAnswer();
-  if (intent === 'STAFF') return staffAnswer(q);
+  if (intent === 'DISPENSE_SPLIT') return await dispenseSplitAnswer();
+  if (intent === 'DISPENSE_RETURN') return await dispenseReturnAnswer();
+  if (intent === 'MATERIAL') return await materialAnswer();
+  if (intent === 'STAFF') return await staffAnswer(q);
   if (intent === 'GLOSSARY') {
     const g = await glossaryAnswer(q, 'CS');
     if (g) return g;
     return { ...capabilityMenu(q), answer: '口径库暂未收录该说法（已回流概念缺口）。' + capabilityMenu(q).answer };
   }
-  if (intent === 'DOC_QA') return docQaAnswer(q);
+  if (intent === 'DOC_QA') return await docQaAnswer(q);
   if (intent === 'SEMANTIC_QUERY') {
     // 先试语义问数，失败落结构推理
     const a = await analyticsAsk(q);
     if (a.mode === 'QUERY' || a.metricCards || a.mode === 'MODEL_ANSWER') return { ...a, intent, router: 'SEMANTIC' };
-    return semanticModelAnswer(q);
+    return await semanticModelAnswer(q);
   }
   return capabilityMenu(q);
 }
@@ -569,7 +597,7 @@ R.post('/ask', async (req, res) => {
 // 澄清任务
 // ============================================================
 R.post('/clarify/:id/answer', async (req, res) => {
-  const task = platform.prepare('SELECT * FROM bm_clarify_task WHERE id=?').get(req.params.id);
+  const task = await platform.prepare('SELECT * FROM bm_clarify_task WHERE id=?').get(req.params.id);
   if (!task) throw new BizException('澄清任务不存在');
   if (task.status !== 'PENDING') throw new BizException('任务已关闭');
   const supplement = String(req.body?.supplement || '').trim();
@@ -578,94 +606,96 @@ R.post('/clarify/:id/answer', async (req, res) => {
   if ((task.supplement ? task.supplement.length + supplement.length : supplement.length) > 1024) throw new BizException('累计补充超过 1024 字');
   const newSupplement = task.supplement ? `${task.supplement}；${supplement}` : supplement;
   const qp = `${task.origin_question}（${newSupplement}）`;
-  platform.prepare('UPDATE bm_clarify_task SET supplement=?, rounds=rounds+1 WHERE id=?').run(newSupplement, task.id);
+  await platform.prepare('UPDATE bm_clarify_task SET supplement=?, rounds=rounds+1 WHERE id=?').run(newSupplement, task.id);
   // 重入同一路由
   const scene = task.scene === 'ANALYTICS' ? 'ANALYTICS' : 'CS';
   const result = scene === 'ANALYTICS' ? await analyticsAsk(qp) : await csAsk(qp);
   const stillUnclear = result.clarify || result.unanswered;
   if (!stillUnclear) {
-    platform.prepare("UPDATE bm_clarify_task SET status='RESOLVED', answered_at=?, closed_at=? WHERE id=?").run(now(), now(), task.id);
+    await platform.prepare("UPDATE bm_clarify_task SET status='RESOLVED', answered_at=?, closed_at=? WHERE id=?").run(now(), now(), task.id);
     result.clarifyResolved = true;
   } else {
     const rounds = task.rounds + 1;
     if (rounds >= 2) {
       const miss = recordMiss(qp.slice(0, 64), 'QUESTION', scene === 'ANALYTICS' ? 'QA_ASK' : 'CS_ASK');
-      platform.prepare("UPDATE bm_clarify_task SET status='GAVE_UP', miss_id=?, closed_at=? WHERE id=?").run(miss?.id || null, now(), task.id);
+      await platform.prepare("UPDATE bm_clarify_task SET status='GAVE_UP', miss_id=?, closed_at=? WHERE id=?").run(miss?.id || null, now(), task.id);
       result.gaveUp = true;
       result.answer = '两轮澄清仍未命中，已回流本体增长回路（概念缺口）。' + (result.answer || '');
     } else {
       result.clarify = { id: task.id, clarifyQuestion: result.clarify?.clarifyQuestion || '请再补充一些信息（时间范围/科室/对象/口径）。', rounds };
-      platform.prepare('UPDATE bm_clarify_task SET rounds=? WHERE id=?').run(rounds, task.id);
+      await platform.prepare('UPDATE bm_clarify_task SET rounds=? WHERE id=?').run(rounds, task.id);
     }
   }
   res.json(ok(result));
 });
-R.get('/clarify/list', (req, res) => {
-  res.json(ok(platform.prepare("SELECT * FROM bm_clarify_task ORDER BY CASE status WHEN 'PENDING' THEN 0 WHEN 'GAVE_UP' THEN 1 ELSE 2 END, id DESC").all()));
+R.get('/clarify/list', async (req, res) => {
+  const rows = await platform.prepare("SELECT * FROM bm_clarify_task ORDER BY CASE status WHEN 'PENDING' THEN 0 WHEN 'GAVE_UP' THEN 1 ELSE 2 END, id DESC").all();
+  res.json(ok(rows));
 });
 
 // 路由评议
-R.post('/feedback', (req, res) => {
+R.post('/feedback', async (req, res) => {
   const { question, intent, router: rt, correct, comment } = req.body || {};
   if (!question) throw new BizException('问题不能为空');
-  platform.prepare('INSERT INTO bm_cs_feedback(question,intent,router,correct,comment) VALUES (?,?,?,?,?)')
+  await platform.prepare('INSERT INTO bm_cs_feedback(question,intent,router,correct,comment) VALUES (?,?,?,?,?)')
     .run(question, intent || null, rt || null, correct ? 1 : 0, comment || null);
   res.json(ok(true));
 });
-R.get('/feedback/list', (req, res) => {
+R.get('/feedback/list', async (req, res) => {
   const pageNum = Math.max(1, parseInt(req.query.pageNum || '1', 10));
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize || '20', 10)));
-  const total = platform.prepare('SELECT COUNT(*) c FROM bm_cs_feedback').get().c;
-  res.json(ok({ list: platform.prepare('SELECT * FROM bm_cs_feedback ORDER BY id DESC LIMIT ? OFFSET ?').all(pageSize, (pageNum - 1) * pageSize), total, pageNum, pageSize }));
+  const totalRow = await platform.prepare('SELECT COUNT(*) c FROM bm_cs_feedback').get();
+  const list = await platform.prepare('SELECT * FROM bm_cs_feedback ORDER BY id DESC LIMIT ? OFFSET ?').all(pageSize, (pageNum - 1) * pageSize);
+  res.json(ok({ list, total: totalRow.c, pageNum, pageSize }));
 });
 
 // ============================================================
 // 工单诊断 / 一键处置
 // ============================================================
 R.get('/ticket/:id/diagnosis', async (req, res) => {
-  const ticket = platform.prepare('SELECT * FROM link_node WHERE id=?').get(req.params.id);
+  const ticket = await platform.prepare('SELECT * FROM link_node WHERE id=?').get(req.params.id);
   if (!ticket) throw new BizException('工单不存在');
-  const r = runRca(ticket.ref_no);
+  const r = await runRca(ticket.ref_no);
   const rootCause = await enhanceRcaWithLlm(r.caseId);
   res.json(ok({ ...r, conclusion: rootCause || r.conclusion, llmUsed: !!rootCause }));
 });
-R.post('/ticket/:id/refund', (req, res) => {
-  const ticket = platform.prepare('SELECT * FROM link_node WHERE id=?').get(req.params.id);
+R.post('/ticket/:id/refund', async (req, res) => {
+  const ticket = await platform.prepare('SELECT * FROM link_node WHERE id=?').get(req.params.id);
   if (!ticket) throw new BizException('工单不存在');
   const operator = req.query.operator || '客服';
   let payload = {};
   try { payload = JSON.parse(ticket.payload || '{}'); } catch { /* */ }
   const inhos = payload.inhos_no;
   if (!inhos) throw new BizException('工单缺少住院号，无法生成退费申请');
-  const charge = businessDb('DS_CHARGE');
-  const his = businessDb('DS_HIS');
-  const rows = his.prepare(`SELECT f.fee_id, f.amount FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id
+  const charge = await businessDb('DS_CHARGE');
+  const his = await businessDb('DS_HIS');
+  const rows = await his.prepare(`SELECT f.fee_id, f.amount FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id
     WHERE o.order_status='2' AND f.fee_status='1' AND f.inhos_no=?`).all(inhos);
   if (!rows.length) throw new BizException('该患者无「取消未退费」费用');
   const refunds = [];
   for (const r of rows) {
-    const exist = charge.prepare('SELECT refund_id FROM refund_apply WHERE fee_id=?').get(r.fee_id);
+    const exist = await charge.prepare('SELECT refund_id FROM refund_apply WHERE fee_id=?').get(r.fee_id);
     if (exist) { refunds.push({ refundId: exist.refund_id, feeId: r.fee_id, reused: true }); continue; }
     const refundId = `RA${now().replace(/[-: ]/g, '')}${String(Math.floor(Math.random() * 900) + 100)}`;
-    charge.prepare('INSERT INTO refund_apply(refund_id,inhos_no,fee_id,amount,reason,apply_time,status) VALUES (?,?,?,?,?,?,?)')
+    await charge.prepare('INSERT INTO refund_apply(refund_id,inhos_no,fee_id,amount,reason,apply_time,status) VALUES (?,?,?,?,?,?,?)')
       .run(refundId, inhos, r.fee_id, r.amount, `客服工单 ${ticket.ref_no} 处置`, now(), '1');
     refunds.push({ refundId, feeId: r.fee_id, amount: r.amount });
   }
   // 处置单 + 工单办结（ref_no 唯一，加随机后缀防止同秒批量处置撞约束）
   const disId = `DIS${now().replace(/[-: ]/g, '')}${Math.random().toString(36).slice(2, 6)}`;
-  platform.prepare('INSERT INTO link_node(node_type,ref_no,title,concept_code,status,occurred_at,payload) VALUES (?,?,?,?,?,?,?)')
+  await platform.prepare('INSERT INTO link_node(node_type,ref_no,title,concept_code,status,occurred_at,payload) VALUES (?,?,?,?,?,?,?)')
     .run('DISPOSAL', disId, `退费处置单（${inhos}）`, ticket.concept_code, '已办结', now(), JSON.stringify({ refunds, operator }));
-  platform.prepare('INSERT OR IGNORE INTO link_rel(from_ref_no,to_ref_no,rel_type,remark) VALUES (?,?,?,?)')
+  await platform.prepare('INSERT INTO link_rel(from_ref_no,to_ref_no,rel_type,remark) VALUES (?,?,?,?) ON CONFLICT DO NOTHING')
     .run(ticket.ref_no, disId, 'CLOSED_BY', '一键处置生成');
-  platform.prepare("UPDATE link_node SET status='已处置' WHERE id=?").run(ticket.id);
+  await platform.prepare("UPDATE link_node SET status='已处置' WHERE id=?").run(ticket.id);
   res.json(ok({ refunds, disposalRef: disId, refundCount: refunds.length, totalAmount: rows.reduce((s, r) => s + r.amount, 0) }));
 });
 R.get('/ticket/customer-reply/:id', async (req, res) => {
-  const ticket = platform.prepare('SELECT * FROM link_node WHERE id=?').get(req.params.id);
+  const ticket = await platform.prepare('SELECT * FROM link_node WHERE id=?').get(req.params.id);
   if (!ticket) throw new BizException('工单不存在');
-  const cases = platform.prepare('SELECT * FROM rca_case WHERE ticket_ref=? ORDER BY id DESC LIMIT 1').get(ticket.ref_no);
+  const cases = await platform.prepare('SELECT * FROM rca_case WHERE ticket_ref=? ORDER BY id DESC LIMIT 1').get(ticket.ref_no);
   const rootCause = cases?.conclusion || '';
-  const conceptBasis = basisEntries(ticket.concept_code);
+  const conceptBasis = await basisEntries(ticket.concept_code);
   const llm = await chat('CS_REPLY', '你是医院客服主管。基于根因结论给客户写一段致歉与解释回复，专业诚恳，150字以内。',
     `工单：${ticket.title}\n根因：${rootCause}\n整改依据条目：${conceptBasis.map(b => b.title).join('、') || '无'}`);
   const reply = llm || `您好，经排查：${rootCause} 我们已启动存量费用补偿退费，并将字典一致性纳入每日巡检防止再次发生。给您带来不便深表歉意。${conceptBasis.length ? `（整改依据条目：${conceptBasis.map(b => b.title).join('、')}）` : ''}`;
@@ -673,10 +703,10 @@ R.get('/ticket/customer-reply/:id', async (req, res) => {
 });
 
 // 跨库核对差异查询
-R.get('/recon/diffs', (req, res) => {
+R.get('/recon/diffs', async (req, res) => {
   const { runId } = req.query;
   const rows = runId
-    ? platform.prepare('SELECT * FROM bm_recon_diff WHERE run_id=? ORDER BY id').all(runId)
-    : platform.prepare('SELECT * FROM bm_recon_diff WHERE run_id=(SELECT run_id FROM bm_recon_diff ORDER BY id DESC LIMIT 1) ORDER BY id').all();
+    ? await platform.prepare('SELECT * FROM bm_recon_diff WHERE run_id=? ORDER BY id').all(runId)
+    : await platform.prepare('SELECT * FROM bm_recon_diff WHERE run_id=(SELECT run_id FROM bm_recon_diff ORDER BY id DESC LIMIT 1) ORDER BY id').all();
   res.json(ok(rows));
 });

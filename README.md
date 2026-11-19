@@ -31,6 +31,15 @@ cd web && npm install && npm run dev
 | reviewer | reviewer123 | REVIEWER 评审/发布（防自审） |
 | viewer | viewer123 | VIEWER 只读 |
 
+## 测试（node:test，零外部依赖）
+
+```bash
+cd server && npm test   # 110 个测试，node:test + node:sqlite 内置，无需额外依赖
+```
+
+- 全部测试使用隔离的 `data-test/` 数据目录（环境变量 `DATA_DIR`），不触碰 `data/` 运行时库，可重复运行。
+- 覆盖：纯函数（JSON 容错解析/余弦/切分/状态机/脱敏）、本体集成（16 域 44 概念种子、继承防环、传递闭包、自检）、lab 沙箱（16 表克隆、裂缝数字契约 5 笔/¥205、工具契约）、以及 auth/cs/flow/gov/knowledge/link/release 各模块集成测试。
+
 ## LLM 配置（server/.env，已接实测可用源）
 
 当前主备（均为推理模型，单次 25~60s，链路全程 1~3 分钟属正常）：
@@ -105,6 +114,7 @@ server/src/
 ├── flow.js           # 医嘱闭环 + 质控 + RDF/SHACL
 ├── rca.js misc.js    # RCA / 架构 / 搜索 / 巡检 / lab / 沙盘 / MCP
 └── seed/             # demo.js（九库 41 患者全闭环）platform.js（本体种子）
+server/test/          # node:test：10 个文件 110 个测试（隔离 data-test/ 目录）
 web/src/              # Vue3：18 组页面 + api + store + router
 data/                 # 运行时生成：平台库 + 九个演示库（SQLite）
 _reference/           # 原仓库源码（研究用）

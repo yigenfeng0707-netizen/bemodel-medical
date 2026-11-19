@@ -45,9 +45,12 @@ export function hasAnyRole(req, ...roles) {
 // - POST/PUT/DELETE /api/** 仅 ADMIN/EDITOR（transition 类额外放行 REVIEWER）
 // - 非 /api/** 放行
 export function requireAuth(req, res, next) {
+  // 魔搭禁用 Authorization 头，优先读 X-Token；本地开发保留 Bearer 兼容
+  const xToken = req.headers['x-token'] || '';
   const h = req.headers.authorization || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
-  const claims = m ? parseToken(m[1]) : null;
+  const token = xToken || (m ? m[1] : '');
+  const claims = token ? parseToken(token) : null;
   if (claims) req.auth = { username: claims.sub, role: claims.role, displayName: claims.displayName };
   next();
 }
@@ -85,25 +88,25 @@ export function authorize(req, res, next) {
 
 // ---------- 路由 ----------
 export const authRouter = express.Router();
-authRouter.post('/login', (req, res) => {
+authRouter.post('/login', async (req, res) => {
   const { username, password } = req.body || {};
-  const user = platform.prepare('SELECT * FROM bm_user WHERE username=?').get(username || '');
+  const user = await platform.prepare('SELECT * FROM bm_user WHERE username=?').get(username || '');
   if (!user || !bcrypt.compareSync(password || '', user.password_hash)) {
     throw new BizException('用户名或密码错误');
   }
   res.json(ok({ token: issueToken(user), username: user.username, displayName: user.display_name, role: user.role }));
 });
-authRouter.get('/me', (req, res) => {
+authRouter.get('/me', async (req, res) => {
   const a = currentReq(req);
   if (!a) return deny(res, 401, '未登录或已过期');
-  const user = platform.prepare('SELECT username, display_name, role FROM bm_user WHERE username=?').get(a.username);
+  const user = await platform.prepare('SELECT username, display_name, role FROM bm_user WHERE username=?').get(a.username);
   res.json(ok({ username: user.username, displayName: user.display_name, role: user.role }));
 });
 
-export function seedUsers() {
-  const ins = platform.prepare('INSERT OR IGNORE INTO bm_user(username, password_hash, display_name, role) VALUES (?,?,?,?)');
-  ins.run('admin', bcrypt.hashSync('admin123', 10), '平台管理员', 'ADMIN');
-  ins.run('modeler', bcrypt.hashSync('model123', 10), '建模工程师', 'EDITOR');
-  ins.run('reviewer', bcrypt.hashSync('reviewer123', 10), '本体评审员', 'REVIEWER');
-  ins.run('viewer', bcrypt.hashSync('viewer123', 10), '只读访客', 'VIEWER');
+export async function seedUsers() {
+  const ins = platform.prepare('INSERT INTO bm_user(username, password_hash, display_name, role) VALUES (?,?,?,?) ON CONFLICT(username) DO NOTHING');
+  await ins.run('admin', bcrypt.hashSync('admin123', 10), '平台管理员', 'ADMIN');
+  await ins.run('modeler', bcrypt.hashSync('model123', 10), '建模工程师', 'EDITOR');
+  await ins.run('reviewer', bcrypt.hashSync('reviewer123', 10), '本体评审员', 'REVIEWER');
+  await ins.run('viewer', bcrypt.hashSync('viewer123', 10), '只读访客', 'VIEWER');
 }
