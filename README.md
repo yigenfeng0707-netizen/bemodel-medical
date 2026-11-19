@@ -45,6 +45,14 @@ cd web && npm install && npm run dev
 - 持久化目录需挂载到 `/var/lib/postgresql/data`（否则每次重启演示数据与自举密钥会重建）；
 - `JWT_SECRET` / `APP_SECRET_KEY` 可不配，入口脚本会在数据卷 `app-secrets/` 下生成并复用。
 
+**线上演示（已部署）**
+
+- 空间主页：https://modelscope.cn/studios/gsym236998/bemodel-medical
+- 公网直连：https://gsym236998-bemodel-medical.ms.show
+- LLM 主备密钥通过空间 Secrets 注入（`LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`，备路 `LLM_BACKUP_*`），**不写入仓库**；`/api/health` 返回 `llm: configured`
+- 魔搭网关禁止 `Authorization` 请求头，应用统一使用 `X-Token` 传递登录令牌
+- 镜像内前端使用本地预构建 `web/dist`，构建机只装服务端依赖（npm 走 npmmirror，apt 走阿里云）
+
 演示账号（与原版 V26/V29 一致）：
 
 | 账号 | 密码 | 角色 |
