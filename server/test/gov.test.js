@@ -1,29 +1,30 @@
 // 治理 + 指标 + 对账组集成测试（隔离 DATA_DIR；HTTP 层：五类探针/质量分/工单转办/状态机/归因桶）
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 
 const dir = path.resolve('data-test', 'gov');
-fs.rmSync(dir, { recursive: true, force: true });
-fs.mkdirSync(dir, { recursive: true });
 process.env.DATA_DIR = dir;
 
-let app, server, adminToken, platform;
+let app, server, adminToken, platform, ensureDatabases;
 
 before(async () => {
-  ({ platform } = await import('../src/db.js'));
+  ({ platform, ensureDatabases } = await import('../src/db.js'));
   const { seedDemoDbs } = await import('../src/seed/demo.js');
   const { seedPlatformData } = await import('../src/seed/platform.js');
   const { govRouter, reconcileRouter } = await import('../src/gov.js');
   const { metricRouter } = await import('../src/metric.js');
   const { requireAuth, authorize, issueToken, seedUsers } = await import('../src/auth.js');
 
-  assert.equal(seedDemoDbs(true), true);
-  seedPlatformData();
-  seedUsers();
-  adminToken = issueToken(platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get());
+  await ensureDatabases();
+  await platform.initSchema();
+
+  assert.equal(await seedDemoDbs(true), true);
+  await seedPlatformData(true);
+  await seedUsers();
+  const admin = await platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get();
+  adminToken = issueToken(admin);
 
   app = express();
   app.use(express.json());
@@ -58,7 +59,7 @@ test('治理扫描: 12 条规则全执行，预埋裂缝被命中（质量分<10
   assert.ok(scan.body.data.qualityScore < 100);
   assert.ok(scan.body.data.qualityScore > 0);
   // 落表
-  const issues = platform.prepare('SELECT * FROM bm_gov_issue WHERE scan_id=?').all(scan.body.data.scanId);
+  const issues = await platform.prepare('SELECT * FROM bm_gov_issue WHERE scan_id=?').all(scan.body.data.scanId);
   assert.equal(issues.length, scan.body.data.issueCount);
   const g4 = issues.find(i => i.rule_code === 'GOV-004');
   assert.ok(g4, 'GOV-004 检验状态字典跨库一致被命中');
@@ -66,7 +67,7 @@ test('治理扫描: 12 条规则全执行，预埋裂缝被命中（质量分<10
 });
 
 test('五类探针类型都被执行（PK_UNIQUE/NOT_NULL/DICT/REF_INTACT/STOCK_BALANCE）', async () => {
-  const types = new Set(platform.prepare('SELECT DISTINCT rule_type t FROM bm_gov_rule').all().map(r => r.t));
+  const types = new Set((await platform.prepare('SELECT DISTINCT rule_type t FROM bm_gov_rule').all()).map(r => r.t));
   assert.deepEqual([...types].sort(), ['DICT_CONSISTENT', 'NOT_NULL', 'PK_UNIQUE', 'REF_INTACT', 'STOCK_BALANCE']);
 });
 
@@ -77,11 +78,11 @@ test('问题清单: 分页返回最新一轮扫描结果', async () => {
 });
 
 test('治理转办: 幂等复用种子工单 T-GOV-GOV-004', async () => {
-  const latest = platform.prepare('SELECT id FROM bm_gov_scan ORDER BY id DESC LIMIT 1').get();
-  const issue = platform.prepare('SELECT id FROM bm_gov_issue WHERE scan_id=? AND rule_code=?').get(latest.id, 'GOV-004');
+  const latest = await platform.prepare('SELECT id FROM bm_gov_scan ORDER BY id DESC LIMIT 1').get();
+  const issue = await platform.prepare('SELECT id FROM bm_gov_issue WHERE scan_id=? AND rule_code=?').get(latest.id, 'GOV-004');
   const r1 = await call('POST', `/api/gov/issues/${issue.id}/ticket`, {});
   assert.equal(r1.body.data.reused, true, '种子已有同名工单 → 复用');
-  const node = platform.prepare('SELECT * FROM link_node WHERE ref_no=?').get(r1.body.data.refNo);
+  const node = await platform.prepare('SELECT * FROM link_node WHERE ref_no=?').get(r1.body.data.refNo);
   assert.equal(node.node_type, 'TICKET');
 });
 
@@ -90,7 +91,7 @@ test('指标实测: CANCEL_NOT_REFUND = 5 笔裂缝，超阈值告警', async ()
   assert.equal(r.body.data.value, 5);
   assert.equal(r.body.data.alarm, true, '阈值 0，实测 5 → 告警');
   // 回写 last_val
-  const m = platform.prepare("SELECT last_val FROM bm_metric WHERE metric_code='CANCEL_NOT_REFUND'").get();
+  const m = await platform.prepare("SELECT last_val FROM bm_metric WHERE metric_code='CANCEL_NOT_REFUND'").get();
   assert.equal(m.last_val, 5);
 });
 
@@ -121,13 +122,13 @@ test('对账执行: 双口径实测 + 差额 + 归因桶结构', async () => {
   assert.equal(typeof r.body.data.bucketsResult.sum, 'number');
   assert.equal(typeof r.body.data.bucketsResult.matchesDiff, 'boolean');
   // 运行记录落表
-  const run = platform.prepare("SELECT * FROM bm_reconcile_run WHERE group_code='DISCHARGE_CLOSE' ORDER BY id DESC LIMIT 1").get();
+  const run = await platform.prepare("SELECT * FROM bm_reconcile_run WHERE group_code='DISCHARGE_CLOSE' ORDER BY id DESC LIMIT 1").get();
   assert.ok(run.values_json.includes('DISCHARGE_COUNT'));
 });
 
 test('下钻: drill_sql 结果脱敏（患者姓名打码）', async () => {
   const r = await call('POST', '/api/reconcile/run/DISCHARGE_CLOSE', {});
-  const run = platform.prepare("SELECT drill_json FROM bm_reconcile_run WHERE group_code='DISCHARGE_CLOSE' ORDER BY id DESC LIMIT 1").get();
+  const run = await platform.prepare("SELECT drill_json FROM bm_reconcile_run WHERE group_code='DISCHARGE_CLOSE' ORDER BY id DESC LIMIT 1").get();
   const rows = JSON.parse(run.drill_json);
   assert.ok(rows.length >= 1);
   for (const row of rows) {
@@ -163,7 +164,7 @@ test('对账状态机: OPEN→CLAIMED→RESOLVED，重跑非零差额自动打�
   const run2 = await call('POST', '/api/reconcile/run/SM_TEST', {});
   assert.equal(run2.body.data.diff, 3);
   assert.equal(run2.body.data.disputeStatus, 'OPEN', '非零差额打回 OPEN');
-  const g = platform.prepare("SELECT * FROM bm_reconcile_group WHERE group_code='SM_TEST'").get();
+  const g = await platform.prepare("SELECT * FROM bm_reconcile_group WHERE group_code='SM_TEST'").get();
   assert.equal(g.dispute_status, 'OPEN');
   assert.equal(g.claimed_by, null, '打回时清除认领人');
 });

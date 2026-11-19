@@ -1,7 +1,6 @@
 // 链路追溯 + 影响分析 + 证据链集成测试（隔离 DATA_DIR；禁用 LLM；BFS/故事线/自动转工单/留痕 spans）
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 
@@ -9,23 +8,24 @@ process.env.LLM_API_KEY = '';
 process.env.LLM_BACKUP_API_KEY = '';
 
 const dir = path.resolve('data-test', 'link');
-fs.rmSync(dir, { recursive: true, force: true });
-fs.mkdirSync(dir, { recursive: true });
 process.env.DATA_DIR = dir;
 
-let app, server, adminToken, platform;
+let app, server, adminToken, platform, ensureDatabases;
 
 before(async () => {
-  ({ platform } = await import('../src/db.js'));
+  ({ platform, ensureDatabases } = await import('../src/db.js'));
+  await ensureDatabases();
+  await platform.initSchema();
   const { seedDemoDbs } = await import('../src/seed/demo.js');
   const { seedPlatformData } = await import('../src/seed/platform.js');
   const { linkRouter, traceRouter } = await import('../src/link.js');
   const { requireAuth, authorize, issueToken, seedUsers } = await import('../src/auth.js');
 
-  assert.equal(seedDemoDbs(true), true);
-  seedPlatformData();
-  seedUsers();
-  adminToken = issueToken(platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get());
+  assert.equal(await seedDemoDbs(true), true);
+  await seedPlatformData(true);
+  await seedUsers();
+  const adminUser = await platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get();
+  adminToken = issueToken(adminUser);
 
   app = express();
   app.use(express.json());
@@ -65,8 +65,8 @@ test('种子故事线: LAB_APPLY 链路含 变更/发布，告警挂 LAB_REPORT�
 });
 
 test('双向 BFS 追溯: 从种子工单追到根因变更', async () => {
-  const ch = platform.prepare("SELECT ref_no FROM link_node WHERE node_type='CHANGE' AND concept_code='LAB_APPLY' ORDER BY id LIMIT 1").get();
-  const tk = platform.prepare("SELECT ref_no FROM link_node WHERE node_type='TICKET' ORDER BY id LIMIT 1").get();
+  const ch = await platform.prepare("SELECT ref_no FROM link_node WHERE node_type='CHANGE' AND concept_code='LAB_APPLY' ORDER BY id LIMIT 1").get();
+  const tk = await platform.prepare("SELECT ref_no FROM link_node WHERE node_type='TICKET' ORDER BY id LIMIT 1").get();
   const r = await call('GET', `/api/link/trace/${tk.ref_no}`);
   assert.equal(r.body.data.root.ref_no, tk.ref_no);
   assert.ok(r.body.data.nodes.some(n => n.ref_no === ch.ref_no), 'BFS 覆盖根因变更节点');
@@ -77,7 +77,8 @@ test('双向 BFS 追溯: 从种子工单追到根因变更', async () => {
 });
 
 test('建节点 + 挂接关系 + 校验', async () => {
-  const ch = platform.prepare("SELECT ref_no FROM link_node WHERE node_type='CHANGE' ORDER BY id LIMIT 1").get().ref_no;
+  const chRow = await platform.prepare("SELECT ref_no FROM link_node WHERE node_type='CHANGE' ORDER BY id LIMIT 1").get();
+  const ch = chRow.ref_no;
   const bad = await call('POST', '/api/link', { nodeType: 'TICKET', refNo: 'T-TEST-001' });
   assert.ok(bad.body.msg.includes('不能为空'));
   const dup = await call('POST', '/api/link', { nodeType: 'TICKET', refNo: ch, title: 'x', conceptCode: 'LAB_APPLY' });
@@ -87,18 +88,21 @@ test('建节点 + 挂接关系 + 校验', async () => {
     linkTarget: ch, relType: 'CAUSES', relDirection: 'up',
   });
   assert.equal(mk.body.data, true);
-  const rel = platform.prepare("SELECT * FROM link_rel WHERE from_ref_no='T-TEST-001' AND to_ref_no=?").get(ch);
+  const rel = await platform.prepare("SELECT * FROM link_rel WHERE from_ref_no='T-TEST-001' AND to_ref_no=?").get(ch);
   assert.equal(rel.rel_type, 'CAUSES', 'relDirection=up → 新节点为因');
 
-  const upd = await call('PUT', '/api/link', { id: platform.prepare("SELECT id FROM link_node WHERE ref_no='T-TEST-001'").get().id, status: '处理中' });
+  const idRow = await platform.prepare("SELECT id FROM link_node WHERE ref_no='T-TEST-001'").get();
+  const upd = await call('PUT', '/api/link', { id: idRow.id, status: '处理中' });
   assert.equal(upd.body.data, true);
-  assert.equal(platform.prepare("SELECT status FROM link_node WHERE ref_no='T-TEST-001'").get().status, '处理中');
+  const statusRow = await platform.prepare("SELECT status FROM link_node WHERE ref_no='T-TEST-001'").get();
+  assert.equal(statusRow.status, '处理中');
   const nope = await call('PUT', '/api/link', { id: 999999 });
   assert.ok(nope.body.msg.includes('不存在'));
 });
 
 test('建关系: 自环/缺端点/未知节点被拒', async () => {
-  const a = platform.prepare('SELECT ref_no FROM link_node LIMIT 1').get().ref_no;
+  const aRow = await platform.prepare('SELECT ref_no FROM link_node LIMIT 1').get();
+  const a = aRow.ref_no;
   assert.ok((await call('POST', '/api/link/rel', { fromRefNo: 'A', toRefNo: 'A', relType: 'X' })).body.msg.includes('自环'));
   assert.ok((await call('POST', '/api/link/rel', { fromRefNo: 'A', relType: 'X' })).body.msg.includes('不能为空'));
   assert.ok((await call('POST', '/api/link/rel', { fromRefNo: a, toRefNo: 'GHOST', relType: 'X' })).body.msg.includes('GHOST'));
@@ -121,13 +125,14 @@ test('自动转工单: 取消未退费按患者建 TICKET，二次幂等，CAUSE
   const r2 = await call('POST', '/api/link/auto-ticket', {});
   assert.equal(r2.body.data.created, 0, '幂等');
   // 新工单标题脱敏
-  const node = platform.prepare("SELECT * FROM link_node WHERE ref_no LIKE 'T-AUTO-%' ORDER BY id DESC LIMIT 1").get();
+  const node = await platform.prepare("SELECT * FROM link_node WHERE ref_no LIKE 'T-AUTO-%' ORDER BY id DESC LIMIT 1").get();
   assert.ok(node.title.includes('自动检测'));
   if (node.payload.includes('patient')) {
     const payload = JSON.parse(node.payload);
     if (payload.patient) assert.ok(payload.patient.includes('*'));
   }
-  assert.ok(platform.prepare("SELECT 1 FROM link_rel r JOIN link_node c ON c.ref_no=r.from_ref_no WHERE r.to_ref_no=? AND c.node_type='CHANGE' AND r.rel_type='CAUSES'").get(node.ref_no));
+  const relCheck = await platform.prepare("SELECT 1 FROM link_rel r JOIN link_node c ON c.ref_no=r.from_ref_no WHERE r.to_ref_no=? AND c.node_type='CHANGE' AND r.rel_type='CAUSES'").get(node.ref_no);
+  assert.ok(relCheck);
 });
 
 test('影响分析: 多跳 BFS + 映射/指标/用例盘点（LLM 关闭走模板）', async () => {
@@ -152,7 +157,7 @@ test('影响分析: 多跳 BFS + 映射/指标/用例盘点（LLM 关闭走模�
 });
 
 test('证据链 MAPPING: 留痕 spans 与锚点', async () => {
-  const m = platform.prepare("SELECT id FROM bm_mapping WHERE status='ACTIVE' ORDER BY id LIMIT 1").get();
+  const m = await platform.prepare("SELECT id FROM bm_mapping WHERE status='ACTIVE' ORDER BY id LIMIT 1").get();
   const r = await call('GET', `/api/trace?type=MAPPING&key=${m.id}`);
   assert.ok(r.body.data.summary.includes('→'));
   assert.ok(r.body.data.anchors.some(a => a.route.includes('/ontology')));

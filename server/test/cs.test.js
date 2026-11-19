@@ -1,7 +1,6 @@
 // 智能客服 + 语义问数集成测试（禁 LLM 走规则降级；六档核对/口径卡/澄清/反馈回路/工单处置）
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 
@@ -10,23 +9,25 @@ process.env.LLM_BACKUP_API_KEY = '';
 process.env.EMBEDDING_TIMEOUT_MS = '1';
 
 const dir = path.resolve('data-test', 'cs');
-fs.rmSync(dir, { recursive: true, force: true });
-fs.mkdirSync(dir, { recursive: true });
 process.env.DATA_DIR = dir;
 
-let app, server, adminToken, platform, businessDb;
+let app, server, adminToken, platform, businessDb, ensureDatabases;
 
 before(async () => {
-  ({ platform, businessDb } = await import('../src/db.js'));
+  ({ platform, businessDb, ensureDatabases } = await import('../src/db.js'));
   const { seedDemoDbs } = await import('../src/seed/demo.js');
   const { seedPlatformData } = await import('../src/seed/platform.js');
   const { csRouter } = await import('../src/cs.js');
   const { requireAuth, authorize, issueToken, seedUsers } = await import('../src/auth.js');
 
-  assert.equal(seedDemoDbs(true), true);
-  seedPlatformData();
-  seedUsers();
-  adminToken = issueToken(platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get());
+  await ensureDatabases();
+  await platform.initSchema();
+
+  assert.equal(await seedDemoDbs(true), true);
+  await seedPlatformData(true);
+  await seedUsers();
+  const admin = await platform.prepare("SELECT * FROM bm_user WHERE username='admin'").get();
+  adminToken = issueToken(admin);
 
   app = express();
   app.use(express.json());
@@ -58,7 +59,7 @@ async function ask(q, scene) {
 
 test('六档跨库核对: 结构不变量 + 落库 bm_recon_diff + 异常计数排除在途/凌晨', async () => {
   const { reconcileDispensePay } = await import('../src/cs.js');
-  const r = reconcileDispensePay();
+  const r = await reconcileDispensePay();
   assert.ok(r.runId.startsWith('RECON-'));
   assert.equal(r.tiers.length, 6);
   assert.deepEqual(r.tiers.map(t => t.stateCode),
@@ -74,7 +75,7 @@ test('六档跨库核对: 结构不变量 + 落库 bm_recon_diff + 异常计数�
     assert.ok(t.attribution.length > 4);
     assert.ok(t.suggestedAction.length > 4);
   }
-  const rows = platform.prepare('SELECT * FROM bm_recon_diff WHERE run_id=?').all(r.runId);
+  const rows = await platform.prepare('SELECT * FROM bm_recon_diff WHERE run_id=?').all(r.runId);
   assert.equal(rows.length, r.diffs.length);
 });
 
@@ -100,7 +101,7 @@ test('DISPENSE_PAY: 实时核对执行（演示数据全配平 → 无差异）'
 test('recon/diffs: 按 runId 过滤 + 默认最新批次', async () => {
   // 演示数据六档配平，合成一行差异验证端点
   const runId = 'RECON-TEST-0001';
-  platform.prepare(`INSERT INTO bm_recon_diff(run_id,direction,state_code,severity,attribution,suggested_action,patient_no,order_id,item_name)
+  await platform.prepare(`INSERT INTO bm_recon_diff(run_id,direction,state_code,severity,attribution,suggested_action,patient_no,order_id,item_name)
     VALUES (?,?,?,?,?,?,?,?,?)`).run(runId, 'A', 'VIOLATION_PREPAY_BYPASS', 'VIOLATION', '先药后费', '追缴', 'ZY20260815001', 'MO-X', '测试项');
   const byRun = await call('GET', `/api/cs/recon/diffs?runId=${runId}`);
   assert.equal(byRun.body.data.length, 1);
@@ -108,7 +109,7 @@ test('recon/diffs: 按 runId 过滤 + 默认最新批次', async () => {
   const latest = await call('GET', '/api/cs/recon/diffs');
   assert.equal(latest.body.data.length, 1);
   assert.equal(latest.body.data[0].run_id, runId);
-  platform.prepare('DELETE FROM bm_recon_diff WHERE run_id=?').run(runId);
+  await platform.prepare('DELETE FROM bm_recon_diff WHERE run_id=?').run(runId);
 });
 
 test('GLOSSARY 口径卡: 指标名命中 → CANCEL_NOT_REFUND 实测 5', async () => {
@@ -126,7 +127,7 @@ test('问数场景: 指标名直命中出卡（router=RULE）', async () => {
   assert.equal(a.router, 'RULE');
   assert.equal(a.metric.metricCode, 'CANCEL_NOT_REFUND');
   assert.ok(a.traceId);
-  const trace = platform.prepare('SELECT * FROM bm_qa_trace WHERE trace_id=?').get(a.traceId);
+  const trace = await platform.prepare('SELECT * FROM bm_qa_trace WHERE trace_id=?').get(a.traceId);
   assert.ok(trace, 'QA 轨迹已落库');
 });
 
@@ -138,12 +139,13 @@ test('问数场景: LLM 不可用规则兜底口径卡（ruleFallback 诚实标�
 });
 
 test('问数场景: 词表外问题 → 能力菜单（parseEmpty，不记 miss）', async () => {
-  const beforeMiss = platform.prepare("SELECT COUNT(*) c FROM bm_ontology_miss WHERE source='QA_ASK'").get().c;
+  const beforeMiss = (await platform.prepare("SELECT COUNT(*) c FROM bm_ontology_miss WHERE source='QA_ASK'").get()).c;
   const a = await ask('今天天气怎么样', 'ANALYTICS');
   assert.equal(a.router, 'REFERRAL');
   assert.equal(a.parseEmpty, true);
   assert.ok(a.answer.includes('语义层已发布概念'));
-  assert.equal(platform.prepare("SELECT COUNT(*) c FROM bm_ontology_miss WHERE source='QA_ASK'").get().c, beforeMiss);
+  const afterMiss = (await platform.prepare("SELECT COUNT(*) c FROM bm_ontology_miss WHERE source='QA_ASK'").get()).c;
+  assert.equal(afterMiss, beforeMiss);
 });
 
 test('能力菜单: 兜不住的问题转智能问数并给入口链接', async () => {
@@ -154,8 +156,9 @@ test('能力菜单: 兜不住的问题转智能问数并给入口链接', async 
 });
 
 test('STAFF: 人员主数据命中与未命中两分支', async () => {
-  const s = businessDb('DS_HIS').prepare("SELECT staff_name FROM staff WHERE staff_name LIKE '%张%' LIMIT 1").get()
-    || businessDb('DS_HIS').prepare('SELECT staff_name FROM staff LIMIT 1').get();
+  const hisDb = await businessDb('DS_HIS');
+  const s = (await hisDb.prepare("SELECT staff_name FROM staff WHERE staff_name LIKE '%张%' LIMIT 1").get())
+    || (await hisDb.prepare('SELECT staff_name FROM staff LIMIT 1').get());
   assert.ok(s, '种子有人员数据');
   const name = s.staff_name;
   // staffAnswer 取问句首个 2-3 字汉字段的末两字做 LIKE，需用空格分隔姓名
@@ -192,29 +195,29 @@ test('澄清任务: 校验规则 + 两轮内补充解决 → RESOLVED', async ()
   const e1 = await call('POST', '/api/cs/clarify/99999/answer', { supplement: 'x' });
   assert.ok(e1.body.msg.includes('不存在'));
   // 建一个 PENDING 任务（LLM 关闭时 AMBIGUITY 分支不可达，直接造）
-  const ins = platform.prepare(`INSERT INTO bm_clarify_task(scene,origin_question,reason,gap_type,clarify_question,status,rounds)
+  const ins = await platform.prepare(`INSERT INTO bm_clarify_task(scene,origin_question,reason,gap_type,clarify_question,status,rounds)
     VALUES ('CS','这个描述不清的问题xyz','','AMBIGUITY','请补充时间范围/科室/对象','PENDING',1)`).run();
   const id = Number(ins.lastInsertRowid);
   // 空补充
   const e2 = await call('POST', `/api/cs/clarify/${id}/answer`, { supplement: '  ' });
   assert.ok(e2.body.msg.includes('不能为空'));
   // 重复补充
-  platform.prepare("UPDATE bm_clarify_task SET supplement='甲' WHERE id=?").run(id);
+  await platform.prepare("UPDATE bm_clarify_task SET supplement='甲' WHERE id=?").run(id);
   const e3 = await call('POST', `/api/cs/clarify/${id}/answer`, { supplement: '甲' });
   assert.ok(e3.body.msg.includes('重复'));
   // 超长
   const e4 = await call('POST', `/api/cs/clarify/${id}/answer`, { supplement: '超'.repeat(1100) });
   assert.ok(e4.body.msg.includes('1024'));
   // 已关闭
-  platform.prepare("UPDATE bm_clarify_task SET status='RESOLVED' WHERE id=?").run(id);
+  await platform.prepare("UPDATE bm_clarify_task SET status='RESOLVED' WHERE id=?").run(id);
   const e5 = await call('POST', `/api/cs/clarify/${id}/answer`, { supplement: 'x' });
   assert.ok(e5.body.msg.includes('已关闭'));
   // 成功路径：重入后规则兜不住 → 能力菜单（无 clarify/unanswered）→ RESOLVED
-  platform.prepare("UPDATE bm_clarify_task SET status='PENDING', supplement='', rounds=1 WHERE id=?").run(id);
+  await platform.prepare("UPDATE bm_clarify_task SET status='PENDING', supplement='', rounds=1 WHERE id=?").run(id);
   const ok1 = await call('POST', `/api/cs/clarify/${id}/answer`, { supplement: '随便补充一点' });
   assert.equal(ok1.body.code, 0);
   assert.equal(ok1.body.data.clarifyResolved, true);
-  const task = platform.prepare('SELECT * FROM bm_clarify_task WHERE id=?').get(id);
+  const task = await platform.prepare('SELECT * FROM bm_clarify_task WHERE id=?').get(id);
   assert.equal(task.status, 'RESOLVED');
   assert.ok(task.answered_at);
   // 列表按 PENDING 优先
@@ -234,7 +237,7 @@ test('评议回路: 提交纠错反馈 + 分页查询（且 routeAsk 读反馈�
 });
 
 test('工单诊断: runRca 七步证据链 + LLM 关闭时 llmUsed=false', async () => {
-  const t = platform.prepare("SELECT id FROM link_node WHERE ref_no='T-20260901-001'").get();
+  const t = await platform.prepare("SELECT id FROM link_node WHERE ref_no='T-20260901-001'").get();
   assert.ok(t);
   const r = await call('GET', `/api/cs/ticket/${t.id}/diagnosis`);
   assert.equal(r.body.code, 0, r.body.msg);
@@ -246,13 +249,14 @@ test('工单诊断: runRca 七步证据链 + LLM 关闭时 llmUsed=false', async
   assert.ok(d.conclusion.includes('全院共影响5名患者、5笔费用'), d.conclusion);
   assert.equal(d.evidence.length, 6);
   assert.equal(d.suggestions.length, 4);
-  const c = platform.prepare('SELECT * FROM rca_case WHERE id=?').get(d.caseId);
+  const c = await platform.prepare('SELECT * FROM rca_case WHERE id=?').get(d.caseId);
   assert.equal(c.status, 'DONE');
-  const rep = platform.prepare('SELECT * FROM rca_report WHERE case_id=?').get(d.caseId);
+  const rep = await platform.prepare('SELECT * FROM rca_report WHERE case_id=?').get(d.caseId);
   assert.equal(rep.llm_used, 0);
   // 步骤 2：患者账单核查命中数与 HIS 实查一致
-  const billCnt = businessDb('DS_HIS').prepare(`SELECT COUNT(*) c FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id
-    WHERE o.order_status='2' AND f.fee_status='1' AND f.inhos_no='ZY20260815001'`).get().c;
+  const hisDb = await businessDb('DS_HIS');
+  const billCnt = (await hisDb.prepare(`SELECT COUNT(*) c FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id
+    WHERE o.order_status='2' AND f.fee_status='1' AND f.inhos_no='ZY20260815001'`).get()).c;
   const step2 = d.steps.find(s => s.stepNo === 2);
   assert.equal(step2.hitCount, billCnt);
   // 步骤 7 报告
@@ -262,18 +266,19 @@ test('工单诊断: runRca 七步证据链 + LLM 关闭时 llmUsed=false', async
 
 test('一键退费: 生成退费申请 + 处置单 + 工单办结，二次调用幂等复用', async () => {
   // 动态找一个 payload 含住院号且该患者确有「取消未退费」费用的工单
-  const tickets = platform.prepare("SELECT id, ref_no, payload FROM link_node WHERE node_type='TICKET' ORDER BY id").all();
+  const tickets = await platform.prepare("SELECT id, ref_no, payload FROM link_node WHERE node_type='TICKET' ORDER BY id").all();
+  const hisDb = await businessDb('DS_HIS');
   let target = null;
   for (const t of tickets) {
     let p = {}; try { p = JSON.parse(t.payload || '{}'); } catch { /* */ }
     if (!p.inhos_no) continue;
-    const n = businessDb('DS_HIS').prepare(`SELECT COUNT(*) c FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id
-      WHERE o.order_status='2' AND f.fee_status='1' AND f.inhos_no=?`).get(p.inhos_no).c;
+    const n = (await hisDb.prepare(`SELECT COUNT(*) c FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id
+      WHERE o.order_status='2' AND f.fee_status='1' AND f.inhos_no=?`).get(p.inhos_no)).c;
     if (n > 0) { target = { ...t, inhos: p.inhos_no }; break; }
   }
   assert.ok(target, '种子中应存在有裂缝费用的工单');
   const t = target;
-  const expected = businessDb('DS_HIS').prepare(`SELECT f.fee_id, f.amount FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id
+  const expected = await hisDb.prepare(`SELECT f.fee_id, f.amount FROM fee_detail f JOIN medical_order o ON f.order_id=o.order_id
     WHERE o.order_status='2' AND f.fee_status='1' AND f.inhos_no=?`).all(t.inhos);
   assert.ok(expected.length >= 1);
   const r1 = await call('POST', `/api/cs/ticket/${t.id}/refund?operator=测试员`, {});
@@ -281,18 +286,20 @@ test('一键退费: 生成退费申请 + 处置单 + 工单办结，二次调用
   assert.equal(r1.body.data.refundCount, expected.length);
   assert.equal(r1.body.data.totalAmount, expected.reduce((s, x) => s + x.amount, 0));
   assert.equal(r1.body.data.refunds.filter(x => x.reused).length, 0);
+  const chargeDb = await businessDb('DS_CHARGE');
   for (const x of r1.body.data.refunds) {
-    const ra = businessDb('DS_CHARGE').prepare('SELECT * FROM refund_apply WHERE refund_id=?').get(x.refundId);
+    const ra = await chargeDb.prepare('SELECT * FROM refund_apply WHERE refund_id=?').get(x.refundId);
     assert.ok(ra, '退费申请已落库');
     assert.equal(ra.status, '1');
   }
   // 处置单 + CLOSED_BY 边 + 工单状态
-  const dis = platform.prepare("SELECT * FROM link_node WHERE node_type='DISPOSAL' AND ref_no=?").get(r1.body.data.disposalRef);
+  const dis = await platform.prepare("SELECT * FROM link_node WHERE node_type='DISPOSAL' AND ref_no=?").get(r1.body.data.disposalRef);
   assert.ok(dis);
   assert.equal(dis.status, '已办结');
-  const rel = platform.prepare("SELECT * FROM link_rel WHERE from_ref_no=? AND rel_type='CLOSED_BY'").get(t.ref_no);
+  const rel = await platform.prepare("SELECT * FROM link_rel WHERE from_ref_no=? AND rel_type='CLOSED_BY'").get(t.ref_no);
   assert.ok(rel);
-  assert.equal(platform.prepare('SELECT status s FROM link_node WHERE id=?').get(t.id).s, '已处置');
+  const status = await platform.prepare('SELECT status s FROM link_node WHERE id=?').get(t.id);
+  assert.equal(status.s, '已处置');
   // 幂等：二次调用全部复用
   const r2 = await call('POST', `/api/cs/ticket/${t.id}/refund`, {});
   assert.equal(r2.body.code, 0, JSON.stringify(r2.body));
@@ -301,15 +308,15 @@ test('一键退费: 生成退费申请 + 处置单 + 工单办结，二次调用
 });
 
 test('一键退费: 工单缺住院号报错', async () => {
-  const ins = platform.prepare(`INSERT INTO link_node(node_type,ref_no,title,concept_code,status,occurred_at,payload)
-    VALUES ('TICKET','T-TEST-NOINHOS','缺住院号工单','FEE_DETAIL','待处理',datetime('now','localtime'),'{}')`).run();
+  const ins = await platform.prepare(`INSERT INTO link_node(node_type,ref_no,title,concept_code,status,occurred_at,payload)
+    VALUES ('TICKET','T-TEST-NOINHOS','缺住院号工单','FEE_DETAIL','待处理',NOW(),'{}')`).run();
   const id = ins.lastInsertRowid;
   const r = await call('POST', `/api/cs/ticket/${id}/refund`, {});
   assert.ok(r.body.msg.includes('缺少住院号'));
 });
 
 test('客户回复: 模板致歉 + 根因结论 + 整改依据（llmUsed=false）', async () => {
-  const t = platform.prepare("SELECT id FROM link_node WHERE ref_no='T-20260901-001'").get();
+  const t = await platform.prepare("SELECT id FROM link_node WHERE ref_no='T-20260901-001'").get();
   const r = await call('GET', `/api/cs/ticket/customer-reply/${t.id}`);
   assert.equal(r.body.code, 0);
   const d = r.body.data;
