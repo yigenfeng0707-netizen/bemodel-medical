@@ -1,0 +1,121 @@
+name: Deploy to ModelScope Studio
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-modelscope
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MS_TOKEN: ${{ secrets.MODELSCOPE_TOKEN }}
+      STUDIO: ${{ vars.MS_STUDIO_NAME || 'bemodel-medical' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard token
+        run: |
+          if [ -z "$MS_TOKEN" ]; then
+            echo "::error::Missing secret MODELSCOPE_TOKEN (魔搭访问令牌，https://modelscope.cn/my/myaccesstoken)"
+            exit 1
+          fi
+
+      - name: Resolve owner
+        id: owner
+        run: |
+          OWNER="${{ secrets.MODELSCOPE_OWNER }}"
+          if [ -z "$OWNER" ]; then
+            OWNER=$(curl -sS https://modelscope.cn/openapi/v1/users/me \
+              -H "Authorization: Bearer $MS_TOKEN" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["username"])')
+          fi
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build frontend (fresh dist)
+        run: |
+          cd web
+          npm ci
+          npm run build
+          grep -q "X-Token" dist/assets/*.js || { echo "::error::dist missing X-Token interceptor"; exit 1; }
+
+      - name: Clone studio repo
+        run: |
+          git clone "https://oauth2:${MS_TOKEN}@www.modelscope.cn/studios/${{ steps.owner.outputs.owner }}/${STUDIO}.git" studio
+
+      - name: Assemble deployment subset
+        run: |
+          cd studio
+          cp ../Dockerfile ../.dockerignore .
+          mkdir -p server embed web
+          rm -rf server/src server/docker
+          cp -r ../server/src server/src
+          cp -r ../server/docker server/docker
+          cp ../server/package.json ../server/package-lock.json server/
+          rm -rf embed && mkdir embed
+          cp ../embed/package.json ../embed/server.mjs embed/
+          rm -rf web/dist
+          cp -r ../web/dist web/dist
+          # 平台 meta（README.md 卡片头 / .gitattributes）保持不动
+
+      - name: Commit and push
+        run: |
+          cd studio
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -f
+          if git diff --cached --quiet; then
+            echo "No changes to deploy"
+          else
+            git commit -m "deploy: ${GITHUB_SHA::7} from GitHub Actions"
+            git push origin master
+          fi
+          HEAD_LOCAL=$(git rev-parse HEAD)
+          HEAD_REMOTE=$(git ls-remote origin master | cut -f1)
+          if [ "$HEAD_LOCAL" != "$HEAD_REMOTE" ]; then
+            echo "::error::studio HEAD mismatch ($HEAD_LOCAL vs $HEAD_REMOTE)"
+            exit 1
+          fi
+
+      - name: Trigger deploy
+        run: |
+          curl -sS -X POST "https://modelscope.cn/openapi/v1/studios/${{ steps.owner.outputs.owner }}/${STUDIO}/deploy" \
+            -H "Authorization: Bearer $MS_TOKEN" | tee deploy.json
+          python3 -c 'import json;j=json.load(open("deploy.json"));assert j.get("success"),j'
+
+      - name: Wait for build and verify live
+        run: |
+          OWNER="${{ steps.owner.outputs.owner }}"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"
+          ENTRY=$(grep -oE 'assets/index-[^"]+\.js' web/dist/index.html | head -1)
+          S=""
+          for i in $(seq 1 70); do
+            S=$(curl -sS "https://modelscope.cn/api/v1/studio/$OWNER/$STUDIO/status" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["Data"]["Status"])' || echo Unknown)
+            case "$S" in
+              *Fail*|*Error*)
+                echo "::error::build status $S"
+                curl -sS "https://modelscope.cn/openapi/v1/studios/$OWNER/$STUDIO/logs/build" \
+                  -H "Authorization: Bearer $MS_TOKEN" | head -c 3000
+                exit 1;;
+            esac
+            LIVE=$(curl -sS -A "$UA" "https://$OWNER-$STUDIO.ms.show/" | grep -oE 'assets/index-[^"]+\.js' | head -1 || true)
+            if [ "$LIVE" = "$ENTRY" ]; then
+              echo "live entry matches build: $LIVE"
+              curl -sS -A "$UA" "https://$OWNER-$STUDIO.ms.show/api/health"
+              exit 0
+            fi
+            echo "[$i] status=$S live=$LIVE want=$ENTRY"
+            sleep 30
+          done
+          echo "::error::timeout, last status=$S"
+          exit 1

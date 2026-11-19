@@ -1,0 +1,19 @@
+name: Keepalive
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping studio (browser UA required, ms.show CDN filters default UA)
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"
+          OWNER="${{ vars.MS_OWNER || 'gsym236998' }}"
+          STUDIO="${{ vars.MS_STUDIO_NAME || 'bemodel-medical' }}"
+          curl -sS -A "$UA" -o /dev/null -w "studio page: %{http_code}\n" "https://modelscope.cn/studios/$OWNER/$STUDIO"
+          curl -sS -A "$UA" -o /dev/null -w "ms.show: %{http_code}\n" "https://$OWNER-$STUDIO.ms.show/"
+          curl -sS -A "$UA" "https://$OWNER-$STUDIO.ms.show/api/health"
