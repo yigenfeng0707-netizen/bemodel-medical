@@ -13,7 +13,7 @@ import { ontologyRouter } from './ontology.js';
 import { releaseRouter, owlRouter } from './release.js';
 import { metricRouter } from './metric.js';
 import { datasourceRouter } from './datasource.js';
-import { knowledgeRouter } from './knowledge.js';
+import { knowledgeRouter, backfillEmbeddings } from './knowledge.js';
 import { csRouter } from './cs.js';
 import { govRouter, reconcileRouter } from './gov.js';
 import { linkRouter, traceRouter } from './link.js';
@@ -111,6 +111,16 @@ async function bootstrap() {
     }
     await seedUsers();
     await seedPlatformData();
+  }
+
+  // 3.5 向量补齐：embedding 端点可用时把种子文档的分块补上向量（失败保持 NULL，检索降级为关键词路）
+  if (config.embedding.baseUrl) {
+    try {
+      const { updated, remaining } = await backfillEmbeddings();
+      console.log(`[BeModel] 向量补齐完成：新增 ${updated} 个分块，仍缺 ${remaining}`);
+    } catch (e) {
+      console.log(`[BeModel] 向量补齐跳过：${e.message}`);
+    }
   }
 
   // 4. 托管前端静态资源（SPA history fallback）

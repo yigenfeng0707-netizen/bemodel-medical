@@ -102,7 +102,7 @@ python scripts/relay_server.py
 cd server && npm start
 ```
 
-隧道要点（踩坑实录）：Jupyter 终端 WS 直连 URL 少斜杠会 404；PTY 规范模式单行上限 4096（请求 b64 分块写入）；61KB+ 单行长输出会被终端 scrollback 丢头（响应落盘后 base64+fold 成短行回传）；fold 末行可能与 RDONE 粘行（解析时剥离）；会话失效（403）自动调 `scripts/refresh_session.py` 重载控制台页重铸 JWT。知识库新增 `POST /api/knowledge/documents/revectorize` 运维端点，补嵌 NULL 分块。**向量路不可用时全链路诚实降级**为 PG 关键词路（bm_llm_log 可查 EMBED_INGEST/EMBED_QUERY 审计），功能不受损。
+隧道要点（踩坑实录）：Jupyter 终端 WS 直连 URL 少斜杠会 404；PTY 规范模式单行上限 4096（请求 b64 分块写入）；61KB+ 单行长输出会被终端 scrollback 丢头（响应落盘后 base64+fold 成短行回传）；fold 末行可能与 RDONE 粘行（解析时剥离）；会话失效（403）自动调 `scripts/refresh_session.py` 重载控制台页重铸 JWT。知识库启动时自动补齐 NULL 分块向量（`backfillEmbeddings`，重启/重建实例后向量检索依然可用），并提供 `POST /api/knowledge/documents/revectorize` 手动重嵌端点。**向量路不可用时全链路诚实降级**为 PG 关键词路（bm_llm_log 可查 EMBED_INGEST/EMBED_QUERY 审计），功能不受损。
 
 **无 Key 或限流时全链路诚实降级**为规则/模板（客服关键词路由、映射规则匹配、问数口径卡兜底、RCA 固定结论模板），与原版"绝不编造"的设计一致。
 

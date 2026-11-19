@@ -248,8 +248,8 @@ R.post('/documents', upload.single('file'), async (req, res) => {
 R.get('/documents/:id/chunks', async (req, res) => {
   res.json(ok(await platform.prepare('SELECT id, seq, heading, content, (embedding IS NOT NULL)::int AS has_embedding FROM bm_doc_chunk WHERE document_id=? ORDER BY seq').all(req.params.id)));
 });
-// 运维端点：重嵌 NULL 分块（向量路曾不可用时的补齐入口；失败分块保持 NULL，诚实降级走关键词路）
-R.post('/documents/revectorize', async (req, res) => {
+// 运维/启动共用：重嵌 NULL 分块（向量路曾不可用时的补齐入口；失败分块保持 NULL，诚实降级走关键词路）
+export async function backfillEmbeddings() {
   const rows = await platform.prepare('SELECT id, content FROM bm_doc_chunk WHERE embedding IS NULL ORDER BY id').all();
   let updated = 0;
   for (let i = 0; i < rows.length; i += EMBED_BATCH) {
@@ -263,7 +263,10 @@ R.post('/documents/revectorize', async (req, res) => {
     }
   }
   const remainingRow = await platform.prepare('SELECT COUNT(*) n FROM bm_doc_chunk WHERE embedding IS NULL').get();
-  res.json(ok({ updated, remaining: remainingRow.n }));
+  return { updated, remaining: remainingRow.n };
+}
+R.post('/documents/revectorize', async (req, res) => {
+  res.json(ok(await backfillEmbeddings()));
 });
 R.post('/documents/:id/transition', async (req, res) => {
   const doc = await platform.prepare('SELECT * FROM bm_document WHERE id=?').get(req.params.id);
