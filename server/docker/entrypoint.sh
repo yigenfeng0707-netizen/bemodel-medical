@@ -64,6 +64,22 @@ done
 # ---------- 建库（平台库 + 各业务库由后端 ensureDatabases 处理） ----------
 # 后端启动时会自动 CREATE DATABASE 平台库与各业务库，这里无需手动建
 
+# ---------- 本地向量化服务（OpenAI 兼容 /v1/embeddings） ----------
+if [ -f /app/embed/server.mjs ]; then
+  echo "[BeModel] 启动本地向量服务（bge-small-zh-v1.5）…"
+  (cd /app/embed && nohup node server.mjs > /tmp/embed.log 2>&1 &)
+  for i in $(seq 1 60); do
+    if curl -sf http://127.0.0.1:11435/health >/dev/null 2>&1; then
+      echo "[BeModel] 向量服务已就绪"
+      break
+    fi
+    sleep 1
+  done
+  export EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-http://127.0.0.1:11435/v1}
+  export EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-small-zh-v1.5}
+  export EMBEDDING_TIMEOUT_MS=${EMBEDDING_TIMEOUT_MS:-20000}
+fi
+
 # ---------- 启动后端 ----------
 echo "[BeModel] 启动后端服务…"
 exec node src/index.js

@@ -1,0 +1,10 @@
+{
+  "name": "bemodel-embed",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "本地向量化服务（OpenAI 兼容 /v1/embeddings，bge-small-zh-v1.5 ONNX）",
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0"
+  }
+}

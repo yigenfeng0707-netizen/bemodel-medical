@@ -88,7 +88,9 @@ LLM_TIMEOUT_SECONDS=150
 
 其余可用资源与状态：阶跃星辰 step_plan 两把 key 均无额度；internAI 另两把 key 无效、fyg199 上 glm-5.3/minimax/deepseek/qwen 配额耗尽（intern-s2 与 Agents-A1 可用，Agents-A1 推理过长弃用）；SenseNova glm-5.2 可用但 RPM/TPM 限制极紧（留作手动备用）；阿里云 token-plan 全模型未购。网关能力：主备路由 + 连续 2 次失败熔断 5 分钟 + 429 退避重试 + 每次尝试落审计表（页面"版本与LLM"可查）。
 
-EMBEDDING_BASE_URL 可选（OpenAI 兼容 /embeddings，已实测接通：书生开发机 A100 上的 bge-m3 fp16，1024 维）：
+**镜像内置本地向量端点（默认启用，无需任何外部 Key）**：`embed/` 是一个 OpenAI 兼容 `/v1/embeddings` 微服务（`@huggingface/transformers` + `bge-small-zh-v1.5` ONNX 量化，512 维，CLS pooling + normalize）；模型在镜像构建时下载，容器入口自动拉起并监听 `127.0.0.1:11435`，镜像默认 `EMBEDDING_BASE_URL=http://127.0.0.1:11435/v1`、`EMBEDDING_MODEL=bge-small-zh-v1.5`、`EMBEDDING_TIMEOUT_MS=20000`。要改指外部 embedding 端点，覆盖这三个环境变量即可（此时内置服务不影响主流程）。
+
+外部 embedding 端点同样可用（OpenAI 兼容 /embeddings，已实测接通：书生开发机 A100 上的 bge-m3 fp16，1024 维）：
 
 ```bash
 # 向量路启动顺序（三件套）：
