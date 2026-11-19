@@ -53,6 +53,10 @@ cd web && npm install && npm run dev
 - 魔搭网关禁止 `Authorization` 请求头，应用统一使用 `X-Token` 传递登录令牌
 - 镜像内前端使用本地预构建 `web/dist`，构建机只装服务端依赖（npm 走 npmmirror，apt 走阿里云）
 
+**CI/CD（GitHub → 魔搭自动部署）**
+
+push 到 `main` 触发 `.github/workflows/deploy.yml`：CI 内 `npm ci && npm run build` 重建前端（校验 X-Token 拦截器，杜绝 dist 漏重建）→ 组装部署子集（Dockerfile / server / embed / web/dist，保留平台 meta）→ 推送创空间 master → `POST /openapi/v1/studios/.../deploy` 触发构建 → 轮询状态并校验线上入口 hash 与 `/api/health`。需在仓库 Secrets 配置 `MODELSCOPE_TOKEN`（魔搭访问令牌，写权限）；`keepalive.yml` 每 6 小时带浏览器 UA  ping 双地址防休眠。改前端后无需手动 build——CI 会重建；本地直推创空间时仍须先 `cd web && npm run build`。
+
 演示账号（与原版 V26/V29 一致）：
 
 | 账号 | 密码 | 角色 |
