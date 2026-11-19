@@ -82,4 +82,5 @@ fi
 
 # ---------- 启动后端 ----------
 echo "[BeModel] 启动后端服务…"
+cd /app/server
 exec node src/index.js
