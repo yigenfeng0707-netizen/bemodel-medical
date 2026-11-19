@@ -2,7 +2,7 @@
 
 对开源项目 [bemodel-java](https://github.com/yueyezhufeng/bemodel-java)（Java 21 + Spring Boot 3.3 + MySQL 8）的**完整功能复现**。
 
-本机无 Java/MySQL 环境，复现版保持**架构、数据模型、API 设计、功能与演示数据完全对齐**，技术栈换为 **Node.js 24（Express 5 + node:sqlite 内置库）+ Vue 3 + Element Plus + ECharts**，零外部数据库依赖，开箱即跑。
+本机无 Java/MySQL 环境，复现版保持**架构、数据模型、API 设计、功能与演示数据完全对齐**，技术栈换为 **Node.js 22（Express 5 + PostgreSQL 15）+ Vue 3 + Element Plus + ECharts**。PostgreSQL 随单镜像内置（自装 + 自举建库建表），也可无缝切到外部 RDS；镜像可直接部署魔搭创空间或任意 Docker 环境。
 
 ```
 物理自治 · 逻辑统一 —— 九套医院业务库数据不搬家，通过「本体 + 映射」建统一语义层
@@ -10,17 +10,40 @@
 
 ## 快速开始
 
-要求：Node.js ≥ 22（内置 node:sqlite）。
+要求：Docker（推荐）或 Node.js ≥ 22 + PostgreSQL ≥ 14。
+
+### 方式一：Docker Compose（推荐）
 
 ```bash
-# 1. 后端（首次启动自动生成九个演示业务库 + 平台种子数据，确定性可重复）
-cd server && npm install && npm start
-# → http://127.0.0.1:18080
-
-# 2. 前端
-cd web && npm install && npm run dev
-# → http://127.0.0.1:5173（/api 已代理到 18080）
+# 生产环境必须显式提供密钥（容器入口也会在数据卷内自动生成一份）
+JWT_SECRET=请替换 APP_SECRET_KEY=请替换 docker compose up -d --build
+# → http://127.0.0.1:7860（前端由后端直接托管，单端口）
 ```
+
+镜像内自动：初始化 PostgreSQL → 创建平台库与九个业务库 → 建表 → 播种演示数据 → 启动后端并托管前端。
+
+### 方式二：本地开发
+
+```bash
+# 1. 准备 PostgreSQL（示例：库 bemodel_platform + 九个业务库由后端自动创建）
+#    需一个具备建库权限的账号，默认 bemodel/bemodel@127.0.0.1:5432，可用 PG_* 环境变量覆盖
+
+# 2. 后端（首次启动自动建库建表 + 播种）
+cd server && npm install && npm start
+# → http://127.0.0.1:7860（PORT 可覆盖，默认 7860）
+
+# 3. 前端开发模式（可选；生产由后端托管 web/dist）
+cd web && npm install && npm run dev
+# → http://127.0.0.1:5173（/api 已代理到 7860）
+```
+
+### 方式三：魔搭创空间
+
+单镜像即可运行，无需外部数据库：
+
+- 端口暴露 `7860`（`PORT` 可覆盖）；
+- 持久化目录需挂载到 `/var/lib/postgresql/data`（否则每次重启演示数据与自举密钥会重建）；
+- `JWT_SECRET` / `APP_SECRET_KEY` 可不配，入口脚本会在数据卷 `app-secrets/` 下生成并复用。
 
 演示账号（与原版 V26/V29 一致）：
 
@@ -31,13 +54,14 @@ cd web && npm install && npm run dev
 | reviewer | reviewer123 | REVIEWER 评审/发布（防自审） |
 | viewer | viewer123 | VIEWER 只读 |
 
-## 测试（node:test，零外部依赖）
+## 测试（node:test + PostgreSQL）
 
 ```bash
-cd server && npm test   # 110 个测试，node:test + node:sqlite 内置，无需额外依赖
+cd server && npm test   # 110 个测试，需可连接的 PostgreSQL（PG_HOST/PG_PORT/PG_USER/PG_PASSWORD）
 ```
 
-- 全部测试使用隔离的 `data-test/` 数据目录（环境变量 `DATA_DIR`），不触碰 `data/` 运行时库，可重复运行。
+- 测试按套件通过 `DATA_DIR` 追加库名后缀（如 `bemodel_platform_data_test_xxx`），自动建库建表、互不污染，可重复运行。
+- 并行套件会占用较多连接，PG 建议 `max_connections ≥ 200`（本地验证使用 400）。
 - 覆盖：纯函数（JSON 容错解析/余弦/切分/状态机/脱敏）、本体集成（16 域 44 概念种子、继承防环、传递闭包、自检）、lab 沙箱（16 表克隆、裂缝数字契约 5 笔/¥205、工具契约）、以及 auth/cs/flow/gov/knowledge/link/release 各模块集成测试。
 
 ## LLM 配置（server/.env，已接实测可用源）
@@ -68,7 +92,7 @@ python scripts/relay_server.py
 cd server && npm start
 ```
 
-隧道要点（踩坑实录）：Jupyter 终端 WS 直连 URL 少斜杠会 404；PTY 规范模式单行上限 4096（请求 b64 分块写入）；61KB+ 单行长输出会被终端 scrollback 丢头（响应落盘后 base64+fold 成短行回传）；fold 末行可能与 RDONE 粘行（解析时剥离）；会话失效（403）自动调 `scripts/refresh_session.py` 重载控制台页重铸 JWT。知识库新增 `POST /api/knowledge/documents/revectorize` 运维端点，补嵌 NULL 分块。**向量路不可用时全链路诚实降级**为 FTS5 关键词路（bm_llm_log 可查 EMBED_INGEST/EMBED_QUERY 审计），功能不受损。
+隧道要点（踩坑实录）：Jupyter 终端 WS 直连 URL 少斜杠会 404；PTY 规范模式单行上限 4096（请求 b64 分块写入）；61KB+ 单行长输出会被终端 scrollback 丢头（响应落盘后 base64+fold 成短行回传）；fold 末行可能与 RDONE 粘行（解析时剥离）；会话失效（403）自动调 `scripts/refresh_session.py` 重载控制台页重铸 JWT。知识库新增 `POST /api/knowledge/documents/revectorize` 运维端点，补嵌 NULL 分块。**向量路不可用时全链路诚实降级**为 PG 关键词路（bm_llm_log 可查 EMBED_INGEST/EMBED_QUERY 审计），功能不受损。
 
 **无 Key 或限流时全链路诚实降级**为规则/模板（客服关键词路由、映射规则匹配、问数口径卡兜底、RCA 固定结论模板），与原版"绝不编造"的设计一致。
 
@@ -81,7 +105,7 @@ cd server && npm start
 | 数据源绑定 | `/api/datasource /mapping /instance` | 库注册（AES-256-GCM 密文）、物理快照扫描、映射生命周期 PROPOSED→ACTIVE→DEPRECATED + 留痕、AI 推荐绑定（Top-K 预筛 + miss 回流）、概念实例投影（值字典反解 + 姓名脱敏） |
 | AI 客服 | `/api/cs` | 意图路由（LLM + 关键词兜底 + 错例反馈回路）、工单 RCA 七步诊断（本体遍历→患者账单→跨库核实→字典裂缝定位→影响面→变更留痕→报告）、一键处置退费、跨库核对六语义档、澄清任务（2 轮封顶回流缺口）、评议 |
 | 智能问数 | `/api/cs/ask scene=ANALYTICS` | Ontology2SQL：LLM 生成 SQL → 表/列白名单沙箱 → LIMIT 钳制 → 真执行 → LLM 组织答案；口径卡（口径/公式/探针/阈值/巡检）；UNANSWERABLE 分 A 型歧义（建澄清任务）/ V 型词表缺口（回流 miss） |
-| 知识双轨 | `/api/knowledge` | 文档摄取（md/txt/docx/pdf 内置解析）、500/50 切分、向量化（可选）、FTS5 关键词 + 向量余弦 → RRF(k=60) 混合检索；知识条目"改一条走审批" |
+| 知识双轨 | `/api/knowledge` | 文档摄取（md/txt/docx/pdf 内置解析）、500/50 切分、向量化（可选）、PG 中文 bigram 关键词 + 向量余弦 → RRF(k=60) 混合检索；知识条目"改一条走审批" |
 | 数据治理 | `/api/gov` | 五类规则探针（PK_UNIQUE/NOT_NULL/DICT_CONSISTENT/REF_INTACT/STOCK_BALANCE）、质量分=加权规则通过率、问题转客服工单 |
 | 对账 | `/api/reconcile` | 对账组（多口径实测 + 差额）、归因桶（±sign，matchesDiff=账对上）、下钻钳制、认领/裁决状态机、重跑非零差额自动打回 |
 | 链路追溯 | `/api/link /impact` | 节点/边、双向 BFS 追溯、五条种子故事线、自动检测转工单、变更影响多跳分析 |
@@ -104,8 +128,8 @@ cd server && npm start
 
 ```
 server/src/
-├── index.js          # 装配（路由挂载 + 巡检定时器）
-├── config.js db.js schema.sql common.js auth.js llm.js
+├── index.js          # 装配（安全头/限流/路由挂载 + 巡检定时器 + 前端静态托管）
+├── config.js db.js pg.js schema.pg.sql common.js auth.js llm.js
 ├── ontology.js       # 本体建模 + 自检 + 缺口/提案/漂移
 ├── release.js        # 发布门禁 + 闭包物化 + OWL 导入
 ├── metric.js datasource.js knowledge.js cs.js
@@ -113,22 +137,24 @@ server/src/
 ├── link.js           # 链路 + 影响 + 证据链
 ├── flow.js           # 医嘱闭环 + 质控 + RDF/SHACL
 ├── rca.js misc.js    # RCA / 架构 / 搜索 / 巡检 / lab / 沙盘 / MCP
-└── seed/             # demo.js（九库 41 患者全闭环）platform.js（本体种子）
-server/test/          # node:test：10 个文件 110 个测试（隔离 data-test/ 目录）
+├── seed/             # demo.js（九库 41 患者全闭环）platform.js（本体种子）
+└── docker/entrypoint.sh  # 容器入口：初始化 PG → 自举密钥 → 启动后端
+server/test/          # node:test：10 个文件 110 个测试（按 DATA_DIR 后缀隔离库）
 web/src/              # Vue3：18 组页面 + api + store + router
-data/                 # 运行时生成：平台库 + 九个演示库（SQLite）
+Dockerfile            # 两阶段：前端构建 + 后端/PostgreSQL 单镜像
+docker-compose.yml    # 单服务编排（端口 7860 + 数据卷）
 _reference/           # 原仓库源码（研究用）
 ```
 
 ## 与原版的差异（诚实声明）
 
-1. **技术栈**：Java/Spring/MySQL/Jena → Node/Express/SQLite/内置校验；SQLite 单文件库替代 MySQL 多库，探针 SQL 为 SQLite 方言。
+1. **技术栈**：Java/Spring/MySQL/Jena → Node/Express/PostgreSQL/内置校验；PG 多库实例替代 MySQL 多库，探针 SQL 已改写为 PostgreSQL 方言。
 2. **SHACL**：Apache Jena SHACL → 按原版 6 个 Shape 语义等价的内置校验器（返回结构一致）。
-3. **FTS**：MySQL ngram 全文索引 → SQLite FTS5 + 自实现中文 bigram 查询构造。
-4. **对比实验室/沙盘**：沙盒为独立 SQLite 克隆（16 张表：HIS 医嘱/费用/映射、LIS 字典、药房、收费、EMR 过敏），工具循环协议与四态诚实终态（DONE/BUDGET_CUT/FORMAT_FAILED/LLM_UNAVAILABLE）一致。已验证：GATE 三臂同题全 DONE（A=工具循环 3 步 / B=裸 SQL 9 步 / C=固定系统诚实边界），SILO 裂缝定位可复现 5 笔/¥205。
+3. **全文检索**：MySQL ngram 全文索引 → PostgreSQL 中文 bigram + `ILIKE` 子串召回（可选 trgm GIN 索引加速），与向量检索做 RRF 融合。
+4. **对比实验室/沙盘**：沙盒为独立 PG 库克隆（16 张表：HIS 医嘱/费用/映射、LIS 字典、药房、收费、EMR 过敏），工具循环协议与四态诚实终态（DONE/BUDGET_CUT/FORMAT_FAILED/LLM_UNAVAILABLE）一致。已验证：GATE 三臂同题全 DONE（A=工具循环 3 步 / B=裸 SQL 9 步 / C=固定系统诚实边界），SILO 裂缝定位可复现 5 笔/¥205。
 5. 定时任务（30 分钟巡检 / 每日对账）用 setInterval 表达。
 6. 原版 45 个 Flyway 迁移整合为单 schema + 运行时 DataSeeder（幂等、确定性、无 Random）。
 
 ## 安全提示
 
-演示密钥（JWT_SECRET/APP_SECRET_KEY）为内置 dev 默认值；公网部署前必须替换并启用传输加密；MCP 端点演示期未启用鉴权（与原版拍板一致）。
+生产环境缺少 `JWT_SECRET` / `APP_SECRET_KEY` / `PG_USER` / `PG_PASSWORD` 时后端拒绝启动；容器入口会在数据卷内自动生成并持久化 JWT/APP 密钥（重建镜像不失效，清卷则换新）。已启用 Helmet 安全响应头、登录接口限流（15 次/分钟）与 CORS 白名单（`CORS_ORIGINS`）；`MCP_API_KEY` 为 MCP 端点必填项：未配置时端点一律拒绝，配置后请求需携带 `X-Api-Key: <key>`（或 `Authorization: Bearer <key>`）。公网部署建议再加传输层加密。

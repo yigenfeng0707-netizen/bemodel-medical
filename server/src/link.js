@@ -13,7 +13,7 @@ L.get('/list', async (req, res) => {
   const params = [];
   if (nodeType) { sql += ' AND node_type=?'; params.push(nodeType); }
   if (conceptCode) { sql += ' AND concept_code=?'; params.push(conceptCode); }
-  const total = (await platform.prepare(`SELECT COUNT(*) c FROM (${sql})`).get(...params)).c;
+  const total = (await platform.prepare(`SELECT COUNT(*)::int c FROM (${sql}) t`).get(...params)).c;
   const order = nodeType === 'TICKET' ? " ORDER BY CASE status WHEN '待处理' THEN 0 WHEN '处理中' THEN 1 ELSE 2 END, id DESC" : ' ORDER BY occurred_at DESC, id DESC';
   const list = await platform.prepare(sql + order + ' LIMIT ? OFFSET ?').all(...params, Number(pageSize), (Number(pageNum) - 1) * Number(pageSize));
   res.json(ok({ list, total, pageNum: Number(pageNum), pageSize: Number(pageSize) }));
