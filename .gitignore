@@ -13,3 +13,4 @@ dist/
 data-test/
 .DS_Store
 Thumbs.db
+_archive/
