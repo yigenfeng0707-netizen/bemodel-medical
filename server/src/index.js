@@ -28,7 +28,16 @@ export const app = express();
 app.use(express.json({ limit: '20mb' }));
 
 // ---------- 安全中间件 ----------
-app.use(helmet());
+// 魔搭创空间以跨域 iframe 嵌入本站：frameguard 与 CSP frame-ancestors 必须放行平台域名
+app.use(helmet({
+  frameguard: false,
+  contentSecurityPolicy: {
+    directives: {
+      ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+      'frame-ancestors': ["'self'", 'https://www.modelscope.cn', 'https://modelscope.cn', 'https://*.ms.show'],
+    },
+  },
+}));
 app.use(cors({ origin: config.corsOrigins }));
 // 登录接口限流：15 次/分钟
 const loginLimiter = rateLimit({ windowMs: 60 * 1000, max: 15, standardHeaders: true, legacyHeaders: false, message: '登录请求过于频繁，请稍后再试' });
