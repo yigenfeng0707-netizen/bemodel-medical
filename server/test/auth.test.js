@@ -161,3 +161,40 @@ test('权限矩阵: login / 非 /api 路径免认证放行', async () => {
   const health = await call('POST', '/healthz', {});
   assert.equal(health.body.data, 'anon');
 });
+
+test('登录锁定: 同账号连续失败 5 次后临时锁定，正确密码也拒绝', async () => {
+  for (let i = 0; i < 5; i++) {
+    const bad = await call('POST', '/api/auth/login', { username: 'reviewer', password: 'wrong' });
+    assert.ok(bad.body.msg.includes('用户名或密码错误'), `第 ${i + 1} 次失败应提示口令错误`);
+  }
+  const locked = await call('POST', '/api/auth/login', { username: 'reviewer', password: 'reviewer123' });
+  assert.ok(locked.body.msg.includes('锁定'), '锁定后即使密码正确也应拒绝');
+  assert.ok(!locked.body.data, '锁定时不应签发 token');
+});
+
+test('登录审计: 成功/失败/锁定均落 bm_login_audit', async () => {
+  const okRow = await platform.prepare("SELECT * FROM bm_login_audit WHERE username='admin' AND result='SUCCESS'").all();
+  assert.ok(okRow.length >= 1, '成功登录应留痕');
+  assert.equal(okRow[0].success, 1);
+  const badRow = await platform.prepare("SELECT * FROM bm_login_audit WHERE username='admin' AND result='BAD_CREDENTIALS'").all();
+  assert.ok(badRow.length >= 1, '失败登录应留痕');
+  const lockRow = await platform.prepare("SELECT * FROM bm_login_audit WHERE username='reviewer' AND result='LOCKED'").all();
+  assert.ok(lockRow.length >= 1, '锁定期间尝试应留痕');
+  assert.ok(okRow[0].ip, '审计应记录来源 IP');
+});
+
+test('logout: 登出后原 token 立即失效', async () => {
+  const login = await call('POST', '/api/auth/login', { username: 'viewer', password: 'viewer123' });
+  const token = login.body.data.token;
+  const before1 = await call('GET', '/api/auth/me', undefined, token);
+  assert.equal(before1.body.data.username, 'viewer');
+  const out = await call('POST', '/api/auth/logout', {}, token);
+  assert.equal(out.body.data.loggedOut, true);
+  const after1 = await call('GET', '/api/auth/me', undefined, token);
+  assert.equal(after1.status, 401, '登出后 /me 应 401');
+  const again = await call('POST', '/api/auth/logout', {}, token);
+  assert.equal(again.status, 401, '已吊销 token 不能再次登出');
+  const fresh = await call('POST', '/api/auth/login', { username: 'viewer', password: 'viewer123' });
+  const me2 = await call('GET', '/api/auth/me', undefined, fresh.body.data.token);
+  assert.equal(me2.body.data.username, 'viewer', '重新登录应签发可用的新 token');
+});

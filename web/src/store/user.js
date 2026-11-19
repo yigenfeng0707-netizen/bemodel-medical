@@ -19,11 +19,18 @@ export const useUserStore = defineStore('user', {
       localStorage.setItem('bemodel_token', data.token);
       localStorage.setItem('bemodel_user', JSON.stringify(this.user));
     },
-    logout() {
-      this.token = '';
-      this.user = null;
-      localStorage.removeItem('bemodel_token');
-      localStorage.removeItem('bemodel_user');
+    async logout() {
+      try {
+        if (this.token) {
+          const { logout } = await import('../api');
+          await logout();
+        }
+      } catch { /* 服务端吊销失败不阻塞本地登出 */ } finally {
+        this.token = '';
+        this.user = null;
+        localStorage.removeItem('bemodel_token');
+        localStorage.removeItem('bemodel_user');
+      }
     },
   },
 });

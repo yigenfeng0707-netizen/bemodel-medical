@@ -502,9 +502,10 @@ export async function seedPlatformData(force = false) {
 }
 
 async function seedAll() {
-  // 动态清空平台库全部业务表（排除 bm_user——seedUsers 在外层管理，开发态先于本函数执行）。
+  // 动态清空平台库全部业务表（排除 bm_user——seedUsers 在外层管理，开发态先于本函数执行；
+  // 同时排除 bm_login_audit——登录审计属于安全留痕，不随演示数据重种子而清空）。
   // 生产首次启动为空库时是空操作；测试重复运行时清掉上次残留的运行时数据（发布/工单/对账/质控等）。
-  const tbls = (await platform.prepare("SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> 'bm_user'").all())
+  const tbls = (await platform.prepare("SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename NOT IN ('bm_user','bm_login_audit')").all())
     .map(r => `"${r.tablename}"`);
   if (tbls.length) await platform.prepare(`TRUNCATE TABLE ${tbls.join(',')} CASCADE`).run();
 

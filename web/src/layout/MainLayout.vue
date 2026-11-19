@@ -114,7 +114,7 @@ async function loadNotices() {
 async function readOne(n) { if (n.status === '未读') { await noticeRead(n.id); await loadNotices(); await refresh(); } }
 async function readAll() { await noticeReadAll(); await loadNotices(); await refresh(); }
 async function runInspectNow() { const r = await inspectRun(); ElMessage.success(`巡检完成：评估 ${r.evaluated} 项，告警 ${r.alarmed} 项，新增通知 ${r.noticesCreated}`); await loadNotices(); await refresh(); }
-function onUserCmd(cmd) { if (cmd === 'logout') { userStore.logout(); router.push('/login'); } }
+async function onUserCmd(cmd) { if (cmd === 'logout') { await userStore.logout(); router.push('/login'); } }
 
 onMounted(() => { refresh(); timer = setInterval(refresh, 60000); });
 onUnmounted(() => clearInterval(timer));

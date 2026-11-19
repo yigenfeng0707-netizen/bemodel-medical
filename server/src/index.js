@@ -145,7 +145,9 @@ async function bootstrap() {
 
   // 5. 监听
   app.listen(config.port, config.host, () => {
-    console.log(`[BeModel] 后端已启动 http://${config.host}:${config.port}（演示账号 admin/admin123 · modeler/model123 · reviewer/reviewer123 · viewer/viewer123）`);
+    // 生产环境不打印演示账号密码，避免凭据进入平台日志
+    const demoHint = config.isProd ? '' : '（演示账号 admin/admin123 · modeler/model123 · reviewer/reviewer123 · viewer/viewer123）';
+    console.log(`[BeModel] 后端已启动 http://${config.host}:${config.port}${demoHint}`);
     console.log(`[BeModel] LLM 网关：${llmEnabled() ? '已配置（主备路由+熔断）' : '未配置 API Key，全链路规则/模板降级'}`);
   });
 }

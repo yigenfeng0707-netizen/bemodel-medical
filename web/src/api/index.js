@@ -2,6 +2,7 @@ import request from './request';
 
 export const login = (data) => request.post('/auth/login', data);
 export const me = () => request.get('/auth/me');
+export const logout = () => request.post('/auth/logout', null, { timeout: 5000 });
 
 export const listDomains = () => request.get('/domain/list');
 export const createDomain = (d) => request.post('/domain', d);
