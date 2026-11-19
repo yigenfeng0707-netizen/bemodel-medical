@@ -10,12 +10,12 @@ const R = releaseRouter;
 const CLOSURE_MAX_DEPTH = 12;
 
 /** 传递关系闭包物化：先删后插，返回每个传递关系名的统计 */
-export function rebuildRelationClosures() {
-  const relations = platform.prepare('SELECT * FROM bm_relation WHERE is_transitive=1').all();
+export async function rebuildRelationClosures() {
+  const relations = await platform.prepare('SELECT * FROM bm_relation WHERE is_transitive=1').all();
   const stats = {};
-  platform.prepare('DELETE FROM bm_relation_closure').run();
+  await platform.prepare('DELETE FROM bm_relation_closure').run();
   for (const rel of relations) {
-    const edges = platform.prepare('SELECT * FROM bm_relation WHERE relation_name=?').all(rel.relation_name);
+    const edges = await platform.prepare('SELECT * FROM bm_relation WHERE relation_name=?').all(rel.relation_name);
     const adj = new Map();
     const sources = new Set();
     for (const e of edges) {
@@ -24,7 +24,7 @@ export function rebuildRelationClosures() {
       sources.add(e.from_concept);
     }
     let derived = 0, capped = false;
-    const ins = platform.prepare('INSERT OR IGNORE INTO bm_relation_closure(relation_name,from_concept,to_concept,depth) VALUES (?,?,?,?)');
+    const ins = platform.prepare('INSERT INTO bm_relation_closure(relation_name,from_concept,to_concept,depth) VALUES (?,?,?,?) ON CONFLICT DO NOTHING');
     for (const source of sources) {
       const depthOf = new Map();
       const queue = [];
@@ -42,7 +42,7 @@ export function rebuildRelationClosures() {
         }
       }
       for (const [to, depth] of depthOf) {
-        ins.run(rel.relation_name, source, to, depth);
+        await ins.run(rel.relation_name, source, to, depth);
         derived++;
       }
     }
@@ -51,31 +51,31 @@ export function rebuildRelationClosures() {
   return stats;
 }
 
-function nextTag() {
-  const last = platform.prepare('SELECT version_tag FROM bm_release ORDER BY id DESC LIMIT 1').get();
+async function nextTag() {
+  const last = await platform.prepare('SELECT version_tag FROM bm_release ORDER BY id DESC LIMIT 1').get();
   if (!last) return 'v1.0';
   const m = String(last.version_tag).match(/^v(\d+)\.(\d+)$/);
   if (!m) return last.version_tag + '.1';
   return `v${m[1]}.${parseInt(m[2], 10) + 1}`;
 }
 
-R.get('/list', (req, res) => {
-  res.json(ok(platform.prepare('SELECT id, version_tag, change_summary, element_count, released_by, approved_by, approved_at, created_at FROM bm_release ORDER BY id DESC').all()));
+R.get('/list', async (req, res) => {
+  res.json(ok(await platform.prepare('SELECT id, version_tag, change_summary, element_count, released_by, approved_by, approved_at, created_at FROM bm_release ORDER BY id DESC').all()));
 });
-R.get('/current', (req, res) => {
-  const last = platform.prepare('SELECT version_tag FROM bm_release ORDER BY id DESC LIMIT 1').get();
+R.get('/current', async (req, res) => {
+  const last = await platform.prepare('SELECT version_tag FROM bm_release ORDER BY id DESC LIMIT 1').get();
   res.json(ok({ version: last ? last.version_tag : '未发布' }));
 });
-R.get('/:id', (req, res) => {
-  const r = platform.prepare('SELECT * FROM bm_release WHERE id=?').get(req.params.id);
+R.get('/:id', async (req, res) => {
+  const r = await platform.prepare('SELECT * FROM bm_release WHERE id=?').get(req.params.id);
   if (!r) throw new BizException('版本不存在');
   res.json(ok(r));
 });
-R.post('/publish', (req, res) => {
+R.post('/publish', async (req, res) => {
   if (!hasAnyRole(req, 'REVIEWER', 'ADMIN')) throw new BizException('发布需评审员或管理员角色');
   const force = String(req.body?.force || '') === 'true';
   const { changeSummary, releasedBy } = req.body || {};
-  const check = checkOntology();
+  const check = await checkOntology();
   if (check.blockerCount > 0) {
     throw new BizException(`存在 ${check.blockerCount} 个 BLOCKER 缺陷，拒绝发布：` + check.defects.filter(d => d.severity === 'BLOCKER').map(d => `[${d.type}] ${d.message}`).join('；'));
   }
@@ -84,22 +84,22 @@ R.post('/publish', (req, res) => {
     res.json(ok({ needForce: true, defects: check.defects, message: `存在 ${warn.length} 个 WARN 缺陷，确认发布请传 force=true` }));
     return;
   }
-  const concepts = platform.prepare("SELECT * FROM bm_concept WHERE status='PUBLISHED' ORDER BY code").all();
+  const concepts = await platform.prepare("SELECT * FROM bm_concept WHERE status='PUBLISHED' ORDER BY code").all();
   const conceptCodes = new Set(concepts.map(c => c.code));
   const attributes = concepts.length
-    ? platform.prepare(`SELECT * FROM bm_attribute WHERE concept_code IN (${[...conceptCodes].map(() => '?').join(',')}) ORDER BY concept_code, sort`).all(...conceptCodes)
+    ? await platform.prepare(`SELECT * FROM bm_attribute WHERE concept_code IN (${[...conceptCodes].map(() => '?').join(',')}) ORDER BY concept_code, sort`).all(...conceptCodes)
     : [];
-  const relations = platform.prepare('SELECT * FROM bm_relation ORDER BY id').all();
-  const terms = platform.prepare('SELECT * FROM bm_term ORDER BY id').all();
-  const metrics = platform.prepare('SELECT * FROM bm_metric ORDER BY id').all();
-  const rules = platform.prepare("SELECT * FROM bm_rule WHERE status='PUBLISHED' ORDER BY rule_code").all();
-  const actions = platform.prepare("SELECT * FROM bm_action WHERE status='PUBLISHED' ORDER BY action_code").all();
-  const closures = rebuildRelationClosures();
+  const relations = await platform.prepare('SELECT * FROM bm_relation ORDER BY id').all();
+  const terms = await platform.prepare('SELECT * FROM bm_term ORDER BY id').all();
+  const metrics = await platform.prepare('SELECT * FROM bm_metric ORDER BY id').all();
+  const rules = await platform.prepare("SELECT * FROM bm_rule WHERE status='PUBLISHED' ORDER BY rule_code").all();
+  const actions = await platform.prepare("SELECT * FROM bm_action WHERE status='PUBLISHED' ORDER BY action_code").all();
+  const closures = await rebuildRelationClosures();
   const elementCount = concepts.length + attributes.length + relations.length + terms.length + metrics.length + rules.length + actions.length;
   const snapshot = { concepts, attributes, relations, terms, metrics, rules, actions, relationClosures: closures };
   const user = currentUser(req);
-  const tag = nextTag();
-  platform.prepare(`INSERT INTO bm_release(version_tag, change_summary, element_count, snapshot_json, released_by, approved_by, approved_at, created_at)
+  const tag = await nextTag();
+  await platform.prepare(`INSERT INTO bm_release(version_tag, change_summary, element_count, snapshot_json, released_by, approved_by, approved_at, created_at)
     VALUES (?,?,?,?,?,?,?,?)`).run(
     tag, changeSummary || '', elementCount, JSON.stringify(snapshot), releasedBy || user?.username || '', user?.username || '', now(), now());
   res.json(ok({ versionTag: tag, elementCount, closures }));
@@ -112,45 +112,45 @@ owlRouter.post('/import/preview', async (req, res) => {
 });
 owlRouter.post('/import/execute', async (req, res) => {
   const plan = parseOwl(req.body?.content || '', req.body?.filename || 'upload.ttl');
-  let domain = platform.prepare("SELECT * FROM bm_domain WHERE code='IMPORT'").get();
+  let domain = await platform.prepare("SELECT * FROM bm_domain WHERE code='IMPORT'").get();
   if (!domain) {
-    platform.prepare("INSERT INTO bm_domain(code,name,description,sort) VALUES ('IMPORT','OWL导入域','由 OWL 文件导入自动创建',99)").run();
+    await platform.prepare("INSERT INTO bm_domain(code,name,description,sort) VALUES ('IMPORT','OWL导入域','由 OWL 文件导入自动创建',99)").run();
   }
   let created = 0, updated = 0, skipped = 0;
   for (const item of plan.items) {
     if (item.kind === 'CLASS') {
-      const exist = platform.prepare('SELECT * FROM bm_concept WHERE code=?').get(item.code);
+      const exist = await platform.prepare('SELECT * FROM bm_concept WHERE code=?').get(item.code);
       if (exist && exist.iri && exist.iri !== item.iri) { item.disposition = 'KEY_TAKEN'; skipped++; continue; }
       if (exist) {
-        platform.prepare('UPDATE bm_concept SET name=?, iri=COALESCE(?, iri), updated_at=? WHERE code=?').run(item.name, item.iri, now(), item.code);
+        await platform.prepare('UPDATE bm_concept SET name=?, iri=COALESCE(?, iri), updated_at=? WHERE code=?').run(item.name, item.iri, now(), item.code);
         item.disposition = 'UPDATE'; updated++;
       } else {
-        platform.prepare('INSERT INTO bm_concept(code,name,domain_code,definition,owner,status,version,iri) VALUES (?,?,?,?,?,?,1,?)')
+        await platform.prepare('INSERT INTO bm_concept(code,name,domain_code,definition,owner,status,version,iri) VALUES (?,?,?,?,?,?,1,?)')
           .run(item.code, item.name, 'IMPORT', item.definition || '', 'OWL导入', 'DRAFT', item.iri);
         item.disposition = 'CREATE'; created++;
       }
     } else if (item.kind === 'RELATION') {
-      const exist = platform.prepare('SELECT * FROM bm_relation WHERE from_concept=? AND to_concept=? AND relation_name=?').get(item.from, item.to, item.name);
+      const exist = await platform.prepare('SELECT * FROM bm_relation WHERE from_concept=? AND to_concept=? AND relation_name=?').get(item.from, item.to, item.name);
       if (!exist) {
-        platform.prepare('INSERT INTO bm_relation(from_concept,to_concept,relation_name,description,is_symmetric,is_transitive,iri) VALUES (?,?,?,?,?,?,?)')
+        await platform.prepare('INSERT INTO bm_relation(from_concept,to_concept,relation_name,description,is_symmetric,is_transitive,iri) VALUES (?,?,?,?,?,?,?)')
           .run(item.from, item.to, item.name, 'OWL 导入', item.sym ? 1 : 0, item.trans ? 1 : 0, item.iri || null);
         item.disposition = 'CREATE'; created++;
       } else { item.disposition = 'UPDATE'; updated++; }
     } else if (item.kind === 'ATTRIBUTE') {
-      const exist = platform.prepare('SELECT 1 FROM bm_attribute WHERE concept_code=? AND attr_code=?').get(item.concept, item.attrCode);
+      const exist = await platform.prepare('SELECT 1 FROM bm_attribute WHERE concept_code=? AND attr_code=?').get(item.concept, item.attrCode);
       if (!exist) {
-        platform.prepare('INSERT INTO bm_attribute(concept_code,attr_code,attr_name,data_type,is_key) VALUES (?,?,?,?,0)')
+        await platform.prepare('INSERT INTO bm_attribute(concept_code,attr_code,attr_name,data_type,is_key) VALUES (?,?,?,?,0)')
           .run(item.concept, item.attrCode, item.attrName, item.dataType);
         item.disposition = 'CREATE'; created++;
       } else { item.disposition = 'UPDATE'; updated++; }
     }
     if (item.kind === 'CLASS' && item.parents?.length) {
       for (const p of item.parents) {
-        platform.prepare('INSERT OR IGNORE INTO bm_concept_parent(child_code,parent_code,is_primary) VALUES (?,?,?)').run(item.code, p, item.primaryParent === p ? 1 : 0);
+        await platform.prepare('INSERT INTO bm_concept_parent(child_code,parent_code,is_primary) VALUES (?,?,?) ON CONFLICT DO NOTHING').run(item.code, p, item.primaryParent === p ? 1 : 0);
       }
       if (item.parents.length) {
         const axiomCode = 'AX-IMP-' + Math.abs(hash(item.iri || item.code)).toString(16).toUpperCase().padStart(8, '0');
-        platform.prepare('INSERT OR IGNORE INTO bm_axiom(axiom_code,subject,predicate,object,axiom_type,description) VALUES (?,?,?,?,?,?)')
+        await platform.prepare('INSERT INTO bm_axiom(axiom_code,subject,predicate,object,axiom_type,description) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING')
           .run(axiomCode, item.code, 'subClassOf', item.parents.join(','), '继承', 'OWL 导入溯源');
       }
     }

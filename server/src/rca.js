@@ -18,16 +18,16 @@ const SQL_HOSPITAL_IMPACT = `SELECT COUNT(DISTINCT f.inhos_no) AS patient_cnt, C
   FROM fee_detail f JOIN medical_order o ON f.order_id = o.order_id WHERE o.order_status='2' AND f.fee_status='1'`;
 
 /** RCA 引擎：同步执行七步，步骤实时落库 */
-export function runRca(ticketRef) {
-  const ticket = platform.prepare("SELECT * FROM link_node WHERE ref_no=? AND node_type='TICKET'").get(ticketRef);
+export async function runRca(ticketRef) {
+  const ticket = await platform.prepare("SELECT * FROM link_node WHERE ref_no=? AND node_type='TICKET'").get(ticketRef);
   if (!ticket) throw new BizException('工单不存在或类型不是 TICKET');
   const caseNo = `RCA-${now().replace(/[-: ]/g, '').slice(0, 14)}`;
-  const c = platform.prepare('INSERT INTO rca_case(case_no,ticket_ref,concept_code,status) VALUES (?,?,?,?)')
+  const c = await platform.prepare('INSERT INTO rca_case(case_no,ticket_ref,concept_code,status) VALUES (?,?,?,?)')
     .run(caseNo, ticketRef, ticket.concept_code, 'RUNNING');
   const caseId = c.lastInsertRowid;
   const steps = [];
-  const addStep = (stepNo, stepName, stepType, sqlText, hitCount, resultJson, status = 'SUCCESS') => {
-    const r = platform.prepare('INSERT INTO rca_step(case_id,step_no,step_name,step_type,sql_text,hit_count,result_json,status,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+  const addStep = async (stepNo, stepName, stepType, sqlText, hitCount, resultJson, status = 'SUCCESS') => {
+    const r = await platform.prepare('INSERT INTO rca_step(case_id,step_no,step_name,step_type,sql_text,hit_count,result_json,status,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
       .run(caseId, stepNo, stepName, stepType, sqlText, hitCount, resultJson ? JSON.stringify(resultJson) : null, status, now(), now());
     steps.push({ stepNo, stepName, stepType, sqlText, hitCount, result: resultJson, status });
     return r.lastInsertRowid;
@@ -35,7 +35,7 @@ export function runRca(ticketRef) {
   let conclusion = '';
   try {
     // Step1 本体图遍历（双向 BFS 4 层）
-    const relations = platform.prepare('SELECT * FROM bm_relation').all();
+    const relations = await platform.prepare('SELECT * FROM bm_relation').all();
     const adj = new Map();
     for (const r of relations) {
       if (!adj.has(r.from_concept)) adj.set(r.from_concept, []);
@@ -56,7 +56,7 @@ export function runRca(ticketRef) {
       }
       frontier = next;
     }
-    addStep(1, '沿本体关系遍历数据面', 'TRAVERSE', null, visited.size, { concepts: [...visited], paths: pathText });
+    await addStep(1, '沿本体关系遍历数据面', 'TRAVERSE', null, visited.size, { concepts: [...visited], paths: pathText });
 
     // Step2 患者账单核查
     let payload = {};
@@ -64,11 +64,12 @@ export function runRca(ticketRef) {
     const inhos = payload.inhos_no || '';
     let billRows = [];
     if (inhos) {
-      billRows = businessDb('DS_HIS').prepare(SQL_PATIENT_BILL).all(inhos);
-      addStep(2, '患者账单核查（HIS：取消未退费）', 'PROBE', SQL_PATIENT_BILL, billRows.length,
+      const his = await businessDb('DS_HIS');
+      billRows = await his.prepare(SQL_PATIENT_BILL).all(inhos);
+      await addStep(2, '患者账单核查（HIS：取消未退费）', 'PROBE', SQL_PATIENT_BILL, billRows.length,
         { rows: billRows, patient: maskName(payload.patient || inhos), inhos_no: inhos });
     } else {
-      addStep(2, '患者账单核查（工单缺住院号，跳过）', 'PROBE', null, 0, { note: '工单 payload 缺 inhos_no' });
+      await addStep(2, '患者账单核查（工单缺住院号，跳过）', 'PROBE', null, 0, { note: '工单 payload 缺 inhos_no' });
     }
 
     // Step3 跨库核实 LIS
@@ -76,29 +77,34 @@ export function runRca(ticketRef) {
     if (billRows.length) {
       const orderIds = billRows.map(r => r.order_id);
       const ph = orderIds.map(() => '?').join(',');
-      lisRows = businessDb('DS_LIS').prepare(`${SQL_LIS_APPLY} (${ph})`).all(...orderIds);
-      addStep(3, '跨库核实 LIS 撤销状态', 'PROBE', `${SQL_LIS_APPLY} (...)`, lisRows.length, { rows: lisRows });
+      const lis = await businessDb('DS_LIS');
+      lisRows = await lis.prepare(`${SQL_LIS_APPLY} (${ph})`).all(...orderIds);
+      await addStep(3, '跨库核实 LIS 撤销状态', 'PROBE', `${SQL_LIS_APPLY} (...)`, lisRows.length, { rows: lisRows });
     } else {
-      addStep(3, '跨库核实 LIS（无待核实医嘱，跳过）', 'PROBE', null, 0, { note: 'Step2 无命中' });
+      await addStep(3, '跨库核实 LIS（无待核实医嘱，跳过）', 'PROBE', null, 0, { note: 'Step2 无命中' });
     }
 
     // Step4 字典裂缝定位（根因证据）
-    const mapped = businessDb('DS_HIS').prepare(SQL_STATUS_MAP).all();
-    const actual = businessDb('DS_LIS').prepare(SQL_LIS_ACTUAL).all().map(r => r.apply_status);
-    const dict = businessDb('DS_LIS').prepare(SQL_LIS_DICT).all();
+    const hisForMap = await businessDb('DS_HIS');
+    const mapped = await hisForMap.prepare(SQL_STATUS_MAP).all();
+    const lisForActual = await businessDb('DS_LIS');
+    const actual = (await lisForActual.prepare(SQL_LIS_ACTUAL).all()).map(r => r.apply_status);
+    const lisForDict = await businessDb('DS_LIS');
+    const dict = await lisForDict.prepare(SQL_LIS_DICT).all();
     const mappedCodes = new Set(mapped.map(m => m.src_status));
     const missing = actual.filter(a => !mappedCodes.has(a));
-    addStep(4, '状态字典裂缝定位（根因证据）', 'PROBE', `${SQL_STATUS_MAP}; ${SQL_LIS_ACTUAL}; ${SQL_LIS_DICT}`,
+    await addStep(4, '状态字典裂缝定位（根因证据）', 'PROBE', `${SQL_STATUS_MAP}; ${SQL_LIS_ACTUAL}; ${SQL_LIS_DICT}`,
       missing.length, { mapped, actual, dictVersions: dict, missingCodes: missing });
 
     // Step5 全院影响面
-    const impact = businessDb('DS_HIS').prepare(SQL_HOSPITAL_IMPACT).get();
-    addStep(5, '全院影响面统计', 'PROBE', SQL_HOSPITAL_IMPACT, impact.fee_cnt || 0, impact);
+    const hisForImpact = await businessDb('DS_HIS');
+    const impact = await hisForImpact.prepare(SQL_HOSPITAL_IMPACT).get();
+    await addStep(5, '全院影响面统计', 'PROBE', SQL_HOSPITAL_IMPACT, impact.fee_cnt || 0, impact);
 
     // Step6 翻变更留痕
-    const linkNodes = platform.prepare(`SELECT node_type, ref_no, title, occurred_at FROM link_node
+    const linkNodes = await platform.prepare(`SELECT node_type, ref_no, title, occurred_at FROM link_node
       WHERE concept_code IN (${[...visited].map(() => '?').join(',')}) AND node_type IN ('CHANGE','DEPLOY','TESTCASE','REQUIREMENT') ORDER BY occurred_at`).all(...visited);
-    addStep(6, '关联链路变更留痕', 'LINK', null, linkNodes.length, linkNodes);
+    await addStep(6, '关联链路变更留痕', 'LINK', null, linkNodes.length, linkNodes);
 
     // Step7 生成报告（LLM 或诚实模板）
     const evidence = [
@@ -110,20 +116,20 @@ export function runRca(ticketRef) {
       linkNodes.length ? `关联变更：${linkNodes.map(n => `${n.ref_no} ${n.title}`).join('；')}` : '（无关联变更留痕）',
     ];
     conclusion = `LIS v5.2 升级（2026-08-15）将检验申请撤销状态码由X改为C，但HIS计费适配器status_map未同步配置新码「${missing[0] || 'C'}」的退费映射，导致升级后已撤销的检验医嘱仍正常计费。全院共影响${impact.patient_cnt}名患者、${impact.fee_cnt}笔费用，合计¥${impact.total_amount}。`;
-    addStep(7, '产出根因分析报告', 'REPORT', null, evidence.length, { evidence, conclusion });
+    await addStep(7, '产出根因分析报告', 'REPORT', null, evidence.length, { evidence, conclusion });
 
     // 回写根因追溯边
     for (const n of linkNodes.filter(n => n.node_type === 'CHANGE')) {
-      platform.prepare('INSERT OR IGNORE INTO link_rel(from_ref_no,to_ref_no,rel_type,remark) VALUES (?,?,?,?)')
+      await platform.prepare('INSERT INTO link_rel(from_ref_no,to_ref_no,rel_type,remark) VALUES (?,?,?,?) ON CONFLICT DO NOTHING')
         .run(n.ref_no, ticketRef, 'CAUSES', `根因分析 ${caseNo} 关联`);
     }
-    platform.prepare("UPDATE rca_case SET status='DONE', conclusion=?, finished_at=? WHERE id=?").run(conclusion, now(), caseId);
-    platform.prepare(`INSERT INTO rca_report(case_id, root_cause, evidence_json, impact_json, suggestions_json, llm_used)
+    await platform.prepare("UPDATE rca_case SET status='DONE', conclusion=?, finished_at=? WHERE id=?").run(conclusion, now(), caseId);
+    await platform.prepare(`INSERT INTO rca_report(case_id, root_cause, evidence_json, impact_json, suggestions_json, llm_used)
       VALUES (?,?,?,?,?,0)`)
       .run(caseId, conclusion, JSON.stringify(evidence), JSON.stringify(impact), JSON.stringify(defaultSuggestions(missing)));
     return { caseId, caseNo, conclusion, steps, evidence, impact, suggestions: defaultSuggestions(missing), llmUsed: false };
   } catch (e) {
-    platform.prepare("UPDATE rca_case SET status='FAILED', conclusion=?, finished_at=? WHERE id=?").run(`分析中断：${e.message}`, now(), caseId);
+    await platform.prepare("UPDATE rca_case SET status='FAILED', conclusion=?, finished_at=? WHERE id=?").run(`分析中断：${e.message}`, now(), caseId);
     throw e;
   }
 }
@@ -139,11 +145,11 @@ function defaultSuggestions(missing) {
 
 /** 异步 LLM 报告增强（工单诊断页调用后静默覆盖 root_cause） */
 export async function enhanceRcaWithLlm(caseId) {
-  const c = platform.prepare('SELECT * FROM rca_case WHERE id=?').get(caseId);
+  const c = await platform.prepare('SELECT * FROM rca_case WHERE id=?').get(caseId);
   if (!c) return null;
-  const rep = platform.prepare('SELECT * FROM rca_report WHERE case_id=?').get(caseId);
+  const rep = await platform.prepare('SELECT * FROM rca_report WHERE case_id=?').get(caseId);
   if (!rep) return null;
-  const steps = platform.prepare('SELECT * FROM rca_step WHERE case_id=? ORDER BY step_no').all(caseId);
+  const steps = await platform.prepare('SELECT * FROM rca_step WHERE case_id=? ORDER BY step_no').all(caseId);
   const evidence = [];
   for (const s of steps) {
     if (s.result_json) evidence.push(`【${s.step_name}】命中${s.hit_count}：${s.result_json.slice(0, 300)}`);
@@ -152,25 +158,25 @@ export async function enhanceRcaWithLlm(caseId) {
     '你是医疗信息化根因分析专家。基于给定证据输出根因分析报告，结构：一、问题概述；二、根因结论；三、证据链分析；四、影响范围；五、整改建议。语言专业简洁，500字以内。',
     `工单：${c.ticket_ref}\n证据链：\n${evidence.join('\n')}`);
   if (llm) {
-    platform.prepare('UPDATE rca_report SET root_cause=?, llm_used=1 WHERE case_id=?').run(llm, caseId);
-    platform.prepare('UPDATE rca_case SET conclusion=?, status=\'DONE\' WHERE id=?').run(llm, caseId);
+    await platform.prepare('UPDATE rca_report SET root_cause=?, llm_used=1 WHERE case_id=?').run(llm, caseId);
+    await platform.prepare('UPDATE rca_case SET conclusion=?, status=\'DONE\' WHERE id=?').run(llm, caseId);
     return llm;
   }
   return null; // LLM 未启用时返回 null，调用方 llmUsed 才能诚实为 false（模板结论已在 r.conclusion）
 }
 
-R.post('/start', (req, res) => {
+R.post('/start', async (req, res) => {
   const ticketRef = req.query.ticketRef;
-  const result = runRca(ticketRef);
+  const result = await runRca(ticketRef);
   res.json(ok(result));
 });
-R.get('/list', (req, res) => {
-  res.json(ok(platform.prepare('SELECT * FROM rca_case ORDER BY id DESC').all()));
+R.get('/list', async (req, res) => {
+  res.json(ok(await platform.prepare('SELECT * FROM rca_case ORDER BY id DESC').all()));
 });
-R.get('/:caseId', (req, res) => {
-  const c = platform.prepare('SELECT * FROM rca_case WHERE id=?').get(req.params.caseId);
+R.get('/:caseId', async (req, res) => {
+  const c = await platform.prepare('SELECT * FROM rca_case WHERE id=?').get(req.params.caseId);
   if (!c) throw new BizException('案例不存在');
-  const steps = platform.prepare('SELECT * FROM rca_step WHERE case_id=? ORDER BY step_no').all(c.id);
-  const report = platform.prepare('SELECT * FROM rca_report WHERE case_id=?').get(c.id);
+  const steps = await platform.prepare('SELECT * FROM rca_step WHERE case_id=? ORDER BY step_no').all(c.id);
+  const report = await platform.prepare('SELECT * FROM rca_report WHERE case_id=?').get(c.id);
   res.json(ok({ case: c, steps, report }));
 });

@@ -10,32 +10,36 @@ export const clinicalRouter = express.Router();
 const C = clinicalRouter;
 
 // ==================== 医嘱闭环（住院） ====================
-F.get('/patients', (req, res) => {
+F.get('/patients', async (req, res) => {
   const { keyword = '', pageNum = 1, pageSize = 20 } = req.query;
-  const his = businessDb('DS_HIS');
+  const his = await businessDb('DS_HIS');
   const where = keyword ? "WHERE patient_name LIKE ? OR inhos_no LIKE ?" : '';
   const params = keyword ? [`%${keyword}%`, `%${keyword}%`] : [];
-  const total = his.prepare(`SELECT COUNT(*) c FROM inpatient ${where}`).get(...params).c;
-  const rows = his.prepare(`SELECT * FROM inpatient ${where} ORDER BY admit_time DESC LIMIT ? OFFSET ?`)
+  const total = (await his.prepare(`SELECT COUNT(*) c FROM inpatient ${where}`).get(...params)).c;
+  const rows = await his.prepare(`SELECT * FROM inpatient ${where} ORDER BY admit_time DESC LIMIT ? OFFSET ?`)
     .all(...params, Number(pageSize), (Number(pageNum) - 1) * Number(pageSize));
-  const list = rows.map(r => {
-    const orderCnt = his.prepare('SELECT COUNT(*) c FROM medical_order WHERE inhos_no=?').get(r.inhos_no).c;
-    const feeSum = his.prepare('SELECT CAST(COALESCE(SUM(amount),0) AS INTEGER) s FROM fee_detail WHERE inhos_no=?').get(r.inhos_no).s;
+  const list = await Promise.all(rows.map(async r => {
+    const orderCnt = (await his.prepare('SELECT COUNT(*) c FROM medical_order WHERE inhos_no=?').get(r.inhos_no)).c;
+    const feeSum = (await his.prepare('SELECT CAST(COALESCE(SUM(amount),0) AS INTEGER) s FROM fee_detail WHERE inhos_no=?').get(r.inhos_no)).s;
     return { ...r, patient_name: maskName(r.patient_name), orderCount: orderCnt, feeTotal: feeSum };
-  });
+  }));
   res.json(ok({ list, total, pageNum: Number(pageNum), pageSize: Number(pageSize) }));
 });
 
-F.get('/loop/:inhosNo', (req, res) => {
+F.get('/loop/:inhosNo', async (req, res) => {
   const inhos = req.params.inhosNo;
-  const his = businessDb('DS_HIS'), lis = businessDb('DS_LIS'), charge = businessDb('DS_CHARGE');
-  const ph = businessDb('DS_PHARMACY'), pacs = businessDb('DS_PACS'), nurse = businessDb('DS_NURSE');
-  const patient = his.prepare('SELECT * FROM inpatient WHERE inhos_no=?').get(inhos);
+  const his = await businessDb('DS_HIS');
+  const lis = await businessDb('DS_LIS');
+  const charge = await businessDb('DS_CHARGE');
+  const ph = await businessDb('DS_PHARMACY');
+  const pacs = await businessDb('DS_PACS');
+  const nurse = await businessDb('DS_NURSE');
+  const patient = await his.prepare('SELECT * FROM inpatient WHERE inhos_no=?').get(inhos);
   if (!patient) throw new BizException('住院号不存在');
-  const orders = his.prepare('SELECT * FROM medical_order WHERE inhos_no=? ORDER BY create_time').all(inhos);
-  const fees = his.prepare('SELECT * FROM fee_detail WHERE inhos_no=?').all(inhos);
+  const orders = await his.prepare('SELECT * FROM medical_order WHERE inhos_no=? ORDER BY create_time').all(inhos);
+  const fees = await his.prepare('SELECT * FROM fee_detail WHERE inhos_no=?').all(inhos);
   const feeByOrder = new Map(fees.map(f => [f.order_id, f]));
-  const ordersOut = orders.map(o => {
+  const ordersOut = await Promise.all(orders.map(async o => {
     const fee = feeByOrder.get(o.order_id);
     let execInfo = null, loopStatus = 'PENDING';
     if (o.order_status === '2') {
@@ -44,18 +48,18 @@ F.get('/loop/:inhosNo', (req, res) => {
       loopStatus = 'PENDING';
     } else {
       if (o.order_type === '检验') {
-        const apply = lis.prepare('SELECT * FROM lab_apply WHERE order_id=?').get(o.order_id);
-        const report = apply ? lis.prepare('SELECT * FROM lab_report WHERE apply_id=?').get(apply.apply_id) : null;
+        const apply = await lis.prepare('SELECT * FROM lab_apply WHERE order_id=?').get(o.order_id);
+        const report = apply ? await lis.prepare('SELECT * FROM lab_report WHERE apply_id=?').get(apply.apply_id) : null;
         execInfo = { applyStatus: apply?.apply_status, reportStatus: report?.result_status, reporter: report?.reporter };
       } else if (o.order_type === '检查') {
-        const rep = pacs.prepare('SELECT * FROM exam_report WHERE order_id=?').get(o.order_id);
+        const rep = await pacs.prepare('SELECT * FROM exam_report WHERE order_id=?').get(o.order_id);
         execInfo = { abnormalFlag: rep?.abnormal_flag, conclusion: rep?.conclusion, reviewer: rep?.reviewer };
       } else if (o.order_type === '药品') {
-        const disp = ph.prepare('SELECT * FROM dispense_record WHERE order_id=?').get(o.order_id);
-        const review = ph.prepare('SELECT * FROM presc_review WHERE order_id=?').get(o.order_id);
+        const disp = await ph.prepare('SELECT * FROM dispense_record WHERE order_id=?').get(o.order_id);
+        const review = await ph.prepare('SELECT * FROM presc_review WHERE order_id=?').get(o.order_id);
         execInfo = { dispenseStatus: disp?.status, pharmacist: disp?.pharmacist, reviewResult: review?.review_result, rejectReason: review?.reject_reason, reviewTime: review?.review_time, pharmacist2: review?.pharmacist };
       }
-      const nurseExec = nurse.prepare('SELECT * FROM nurse_exec WHERE order_id=?').get(o.order_id);
+      const nurseExec = await nurse.prepare('SELECT * FROM nurse_exec WHERE order_id=?').get(o.order_id);
       if (nurseExec) execInfo = { ...(execInfo || {}), nurseExec: nurseExec.exec_type, nurse: nurseExec.nurse, execStatus: nurseExec.exec_status };
       const executed = (o.order_type === '检验' && execInfo?.reportStatus) || (o.order_type === '检查' && execInfo?.conclusion) || (o.order_type === '药品' && execInfo?.dispenseStatus === '1') || !!execInfo?.nurseExec;
       loopStatus = executed && fee ? 'CLOSED' : 'PENDING';
@@ -66,30 +70,30 @@ F.get('/loop/:inhosNo', (req, res) => {
       fee: fee ? { amount: fee.amount, feeStatus: fee.fee_status, chargeTime: fee.charge_time } : null,
       execInfo, loopStatus,
     };
-  });
-  const payments = charge.prepare('SELECT * FROM pay_record WHERE inhos_no=? ORDER BY pay_time').all(inhos);
+  }));
+  const payments = await charge.prepare('SELECT * FROM pay_record WHERE inhos_no=? ORDER BY pay_time').all(inhos);
   const payTypeName = { '1': '预交金', '2': '结算补缴', '3': '退费', '4': '门诊缴费' };
-  const settlements = charge.prepare('SELECT * FROM settlement WHERE inhos_no=?').all(inhos);
-  const invoices = settlements.length ? charge.prepare(`SELECT * FROM invoice WHERE settle_id IN (${settlements.map(() => '?').join(',')})`).all(...settlements.map(s => s.settle_id)) : [];
+  const settlements = await charge.prepare('SELECT * FROM settlement WHERE inhos_no=?').all(inhos);
+  const invoices = settlements.length ? await charge.prepare(`SELECT * FROM invoice WHERE settle_id IN (${settlements.map(() => '?').join(',')})`).all(...settlements.map(s => s.settle_id)) : [];
   // 全流程时间线
   const events = [];
   events.push({ at: patient.admit_time, system: 'HIS', name: '入院登记', detail: `${patient.dept} ${patient.ward} 主管：${patient.doctor}` });
   for (const o of orders) {
     events.push({ at: o.create_time, system: 'HIS', name: `开立医嘱：${o.item_name}`, detail: `医生 ${o.doctor}` });
     if (o.cancel_time) events.push({ at: o.cancel_time, system: 'HIS', name: `取消医嘱：${o.item_name}`, detail: '' });
-    const apply = lis.prepare('SELECT * FROM lab_apply WHERE order_id=?').get(o.order_id);
+    const apply = await lis.prepare('SELECT * FROM lab_apply WHERE order_id=?').get(o.order_id);
     if (apply) {
       events.push({ at: apply.apply_time, system: 'LIS', name: `检验申请：${o.item_name}`, detail: `状态 ${apply.apply_status}` });
-      const rep = lis.prepare('SELECT * FROM lab_report WHERE apply_id=?').get(apply.apply_id);
+      const rep = await lis.prepare('SELECT * FROM lab_report WHERE apply_id=?').get(apply.apply_id);
       if (rep) events.push({ at: rep.report_time, system: 'LIS', name: `检验报告：${o.item_name}`, detail: `结果 ${rep.result_status === 'A' ? '异常' : '正常'}（${rep.reporter}）` });
     }
-    const exam = pacs.prepare('SELECT * FROM exam_report WHERE order_id=?').get(o.order_id);
+    const exam = await pacs.prepare('SELECT * FROM exam_report WHERE order_id=?').get(o.order_id);
     if (exam) events.push({ at: exam.report_time, system: 'PACS', name: `检查报告：${o.item_name}`, detail: `${exam.abnormal_flag === 'Y' ? '异常' : '正常'}（${exam.reviewer}）` });
-    const disp = ph.prepare('SELECT * FROM dispense_record WHERE order_id=?').get(o.order_id);
+    const disp = await ph.prepare('SELECT * FROM dispense_record WHERE order_id=?').get(o.order_id);
     if (disp) events.push({ at: disp.dispense_time, system: '药房', name: `调剂发药：${o.item_name}`, detail: `药师 ${disp.pharmacist}` });
-    const review = ph.prepare('SELECT * FROM presc_review WHERE order_id=?').get(o.order_id);
+    const review = await ph.prepare('SELECT * FROM presc_review WHERE order_id=?').get(o.order_id);
     if (review) events.push({ at: review.review_time, system: '药房', name: `处方审核：${review.review_result}`, detail: review.reject_reason || review.pharmacist });
-    const ne = nurse.prepare('SELECT * FROM nurse_exec WHERE order_id=?').get(o.order_id);
+    const ne = await nurse.prepare('SELECT * FROM nurse_exec WHERE order_id=?').get(o.order_id);
     if (ne) events.push({ at: ne.exec_time, system: '护士站', name: `护士执行：${ne.exec_type}`, detail: ne.nurse });
     const fee = feeByOrder.get(o.order_id);
     if (fee) events.push({ at: fee.charge_time, system: '收费', name: `计费：${o.item_name} ¥${fee.amount}`, detail: fee.fee_status === '2' ? '已退费' : '正常计费' });
@@ -115,27 +119,27 @@ F.get('/loop/:inhosNo', (req, res) => {
 });
 
 // ==================== 门诊 ====================
-F.get('/opd/patients', (req, res) => {
-  const opd = businessDb('DS_OPD');
-  const regs = opd.prepare('SELECT * FROM opd_reg ORDER BY reg_time DESC').all();
-  const list = regs.map(r => {
-    const prescs = opd.prepare('SELECT * FROM opd_presc WHERE card_no=?').all(r.pat_card_no);
-    const visit = opd.prepare('SELECT * FROM opd_visit WHERE card_no=?').get(r.pat_card_no);
+F.get('/opd/patients', async (req, res) => {
+  const opd = await businessDb('DS_OPD');
+  const regs = await opd.prepare('SELECT * FROM opd_reg ORDER BY reg_time DESC').all();
+  const list = await Promise.all(regs.map(async r => {
+    const prescs = await opd.prepare('SELECT * FROM opd_presc WHERE card_no=?').all(r.pat_card_no);
+    const visit = await opd.prepare('SELECT * FROM opd_visit WHERE card_no=?').get(r.pat_card_no);
     return {
       ...r, pat_name: maskName(r.pat_name),
       prescCount: prescs.length,
       execTotal: prescs.filter(p => p.presc_status === '3').reduce((s, p) => s + p.price * p.quantity, 0),
       visit,
     };
-  });
+  }));
   res.json(ok(list));
 });
-F.get('/opd/loop/:cardNo', (req, res) => {
-  const opd = businessDb('DS_OPD');
-  const reg = opd.prepare('SELECT * FROM opd_reg WHERE pat_card_no=?').get(req.params.cardNo);
+F.get('/opd/loop/:cardNo', async (req, res) => {
+  const opd = await businessDb('DS_OPD');
+  const reg = await opd.prepare('SELECT * FROM opd_reg WHERE pat_card_no=?').get(req.params.cardNo);
   if (!reg) throw new BizException('就诊卡号不存在');
-  const visit = opd.prepare('SELECT * FROM opd_visit WHERE card_no=?').get(req.params.cardNo);
-  const prescs = opd.prepare('SELECT * FROM opd_presc WHERE card_no=? ORDER BY create_time').all(req.params.cardNo);
+  const visit = await opd.prepare('SELECT * FROM opd_visit WHERE card_no=?').get(req.params.cardNo);
+  const prescs = await opd.prepare('SELECT * FROM opd_presc WHERE card_no=? ORDER BY create_time').all(req.params.cardNo);
   const prescOut = prescs.map(p => {
     let loopStatus = 'UNPAID';
     if (p.presc_status === '0') loopStatus = 'CLOSED_CANCELED';
@@ -153,27 +157,31 @@ F.get('/opd/loop/:cardNo', (req, res) => {
 });
 
 // ==================== 人员下钻 ====================
-F.get('/staff', (req, res) => {
+F.get('/staff', async (req, res) => {
   const name = (req.query.name || '').replace(/医生|护士|药师|主任|副主任/g, '');
-  const his = businessDb('DS_HIS');
-  const staff = his.prepare('SELECT * FROM staff WHERE staff_name LIKE ?').all(`%${name}%`);
+  const his = await businessDb('DS_HIS');
+  const staff = await his.prepare('SELECT * FROM staff WHERE staff_name LIKE ?').all(`%${name}%`);
   if (!staff.length) return res.json(ok({ found: false }));
   const s = staff[0];
-  const dept = his.prepare('SELECT * FROM dept WHERE dept_code=?').get(s.dept_code);
+  const dept = await his.prepare('SELECT * FROM dept WHERE dept_code=?').get(s.dept_code);
   const footprint = {};
-  const dispenses = businessDb('DS_PHARMACY').prepare('SELECT COUNT(*) c FROM dispense_record WHERE pharmacist=?').get(s.staff_name).c;
+  const ph = await businessDb('DS_PHARMACY');
+  const nurse = await businessDb('DS_NURSE');
+  const lis = await businessDb('DS_LIS');
+  const pacs = await businessDb('DS_PACS');
+  const dispenses = (await ph.prepare('SELECT COUNT(*) c FROM dispense_record WHERE pharmacist=?').get(s.staff_name)).c;
   if (dispenses) footprint['调剂发药'] = `${dispenses} 次`;
-  const reviews = businessDb('DS_PHARMACY').prepare('SELECT COUNT(*) c FROM presc_review WHERE pharmacist=?').get(s.staff_name).c;
+  const reviews = (await ph.prepare('SELECT COUNT(*) c FROM presc_review WHERE pharmacist=?').get(s.staff_name)).c;
   if (reviews) footprint['处方审核'] = `${reviews} 次`;
-  const nurses = businessDb('DS_NURSE').prepare('SELECT COUNT(*) c FROM nurse_exec WHERE nurse=?').get(s.staff_name).c;
+  const nurses = (await nurse.prepare('SELECT COUNT(*) c FROM nurse_exec WHERE nurse=?').get(s.staff_name)).c;
   if (nurses) footprint['护理执行'] = `${nurses} 次`;
-  const reports = businessDb('DS_LIS').prepare('SELECT COUNT(*) c FROM lab_report WHERE reporter=?').get(s.staff_name).c;
+  const reports = (await lis.prepare('SELECT COUNT(*) c FROM lab_report WHERE reporter=?').get(s.staff_name)).c;
   if (reports) footprint['检验报告'] = `${reports} 份`;
-  const pacsR = businessDb('DS_PACS').prepare('SELECT COUNT(*) c FROM exam_report WHERE reviewer=?').get(s.staff_name).c;
+  const pacsR = (await pacs.prepare('SELECT COUNT(*) c FROM exam_report WHERE reviewer=?').get(s.staff_name)).c;
   if (pacsR) footprint['检查审核'] = `${pacsR} 份`;
-  const orders = his.prepare('SELECT COUNT(*) c FROM medical_order WHERE doctor=?').get(s.staff_name).c;
+  const orders = (await his.prepare('SELECT COUNT(*) c FROM medical_order WHERE doctor=?').get(s.staff_name)).c;
   if (orders) footprint['开立医嘱'] = `${orders} 条`;
-  const colleagues = dept ? his.prepare('SELECT staff_name, role, title FROM staff WHERE dept_code=? AND staff_id<>?').all(s.dept_code, s.staff_id) : [];
+  const colleagues = dept ? await his.prepare('SELECT staff_name, role, title FROM staff WHERE dept_code=? AND staff_id<>?').all(s.dept_code, s.staff_id) : [];
   res.json(ok({
     found: true, staff: s, dept, footprint, colleagues,
     covered: Object.keys(footprint).length > 0 || ['医生', '护士', '药师'].includes(s.role),
@@ -181,19 +189,22 @@ F.get('/staff', (req, res) => {
 });
 
 // ==================== 病案内涵质控（八类规则引擎，双引擎互证） ====================
-const QC_RULES = () => platform.prepare("SELECT * FROM bm_rule WHERE engine='QC' AND status='PUBLISHED'").all();
-function qcCheckRecord(record) {
-  const his = businessDb('DS_HIS'), lis = businessDb('DS_LIS'), pacs = businessDb('DS_PACS');
-  const emr = businessDb('DS_EMR'), ph = businessDb('DS_PHARMACY');
+const QC_RULES = async () => await platform.prepare("SELECT * FROM bm_rule WHERE engine='QC' AND status='PUBLISHED'").all();
+async function qcCheckRecord(record) {
+  const his = await businessDb('DS_HIS');
+  const lis = await businessDb('DS_LIS');
+  const pacs = await businessDb('DS_PACS');
+  const emr = await businessDb('DS_EMR');
+  const ph = await businessDb('DS_PHARMACY');
   const findings = [];
-  const rules = QC_RULES();
-  const patient = his.prepare('SELECT * FROM inpatient WHERE inhos_no=?').get(record.inhos_no);
+  const rules = await QC_RULES();
+  const patient = await his.prepare('SELECT * FROM inpatient WHERE inhos_no=?').get(record.inhos_no);
   const diagList = String(record.diag_list || record.diag_main || '');
-  const orders = his.prepare("SELECT * FROM medical_order WHERE inhos_no=?").all(record.inhos_no);
+  const orders = await his.prepare("SELECT * FROM medical_order WHERE inhos_no=?").all(record.inhos_no);
   const labs = orders.filter(o => o.order_type === '检验');
   const drugs = orders.filter(o => o.order_type === '药品');
   const exams = orders.filter(o => o.order_type === '检查');
-  const surg = emr.prepare('SELECT * FROM emr_surgery WHERE inhos_no=?').all(record.inhos_no);
+  const surg = await emr.prepare('SELECT * FROM emr_surgery WHERE inhos_no=?').all(record.inhos_no);
   for (const rule of rules) {
     let expr; try { expr = JSON.parse(rule.expr_json || '{}'); } catch { continue; }
     let hit = false, evidence = '';
@@ -215,8 +226,8 @@ function qcCheckRecord(record) {
       }
       case 'ABNORMAL_REQUIRES_COVER': {
         for (const o of labs) {
-          const apply = lis.prepare('SELECT * FROM lab_apply WHERE order_id=?').get(o.order_id);
-          const rep = apply ? lis.prepare('SELECT * FROM lab_report WHERE apply_id=?').get(apply.apply_id) : null;
+          const apply = await lis.prepare('SELECT * FROM lab_apply WHERE order_id=?').get(o.order_id);
+          const rep = apply ? await lis.prepare('SELECT * FROM lab_report WHERE apply_id=?').get(apply.apply_id) : null;
           if (rep && rep.result_status === 'A' && (expr.itemCodes || []).includes(o.item_code)) {
             const covered = drugs.some(d => (expr.drugCodes || []).includes(d.item_code) && String(d.create_time) > String(rep.report_time));
             if (!covered) { hit = true; evidence = `${o.item_name} 报告异常（${rep.report_time}）之后无后续处置用药（需 ${expr.drugCodes.join('/')})`; }
@@ -227,24 +238,32 @@ function qcCheckRecord(record) {
       }
       case 'COMPLICATION_REQUIRES_ITEM': {
         const complications = diagList.split(',').slice(1);
-        const kw = complications.find(d => (expr.complicationKeywords || []).some(k => (DIAG_NAME(d) || d).includes(k)));
+        let kw = null;
+        for (const d of complications) {
+          const dn = await DIAG_NAME(d);
+          if ((expr.complicationKeywords || []).some(k => (dn || d).includes(k))) { kw = d; break; }
+        }
         if (!kw) continue;
         const covered = drugs.some(d => (expr.drugCodes || []).includes(d.item_code));
         hit = !covered;
-        evidence = hit ? `并发症「${DIAG_NAME(kw) || kw}」无对应治疗用药（需 ${expr.drugCodes.join('/')})` : '并发症有处置用药';
+        evidence = hit ? `并发症「${(await DIAG_NAME(kw)) || kw}」无对应治疗用药（需 ${expr.drugCodes.join('/')})` : '并发症有处置用药';
         break;
       }
       case 'SEX_DISJOINT_DIAG': {
         if (!patient || patient.sex !== '男') continue;
-        const kw = diagList.split(',').find(d => (expr.femaleDiagKeywords || []).some(k => (DIAG_NAME(d) || d).includes(k)));
+        let kw = null;
+        for (const d of diagList.split(',')) {
+          const dn = await DIAG_NAME(d);
+          if ((expr.femaleDiagKeywords || []).some(k => (dn || d).includes(k))) { kw = d; break; }
+        }
         if (!kw) continue;
         hit = true;
-        evidence = `男性患者出现诊断「${DIAG_NAME(kw) || kw}」，违反公理 AX-003（性别互斥）`;
+        evidence = `男性患者出现诊断「${(await DIAG_NAME(kw)) || kw}」，违反公理 AX-003（性别互斥）`;
         break;
       }
       case 'EXAM_ABNORMAL_REQUIRES_COVER': {
         for (const o of exams) {
-          const rep = pacs.prepare('SELECT * FROM exam_report WHERE order_id=?').get(o.order_id);
+          const rep = await pacs.prepare('SELECT * FROM exam_report WHERE order_id=?').get(o.order_id);
           if (rep && rep.abnormal_flag === 'Y') {
             const covered = drugs.some(d => (expr.drugCodes || []).includes(d.item_code) && String(d.create_time) > String(rep.report_time));
             if (!covered) { hit = true; evidence = `检查「${o.item_name}」报告异常（${rep.report_time}）后无后续处置用药`; }
@@ -259,77 +278,78 @@ function qcCheckRecord(record) {
   }
   return findings;
 }
-function DIAG_NAME(code) {
+async function DIAG_NAME(code) {
   if (!/^\w+$/.test(String(code))) return null;
-  const d = businessDb('DS_EMR').prepare('SELECT diag_name FROM diag_dict WHERE diag_code=?').get(code);
+  const emr = await businessDb('DS_EMR');
+  const d = await emr.prepare('SELECT diag_name FROM diag_dict WHERE diag_code=?').get(code);
   return d?.diag_name || null;
 }
-C.get('/qc/records', (req, res) => {
+C.get('/qc/records', async (req, res) => {
   const { keyword = '' } = req.query;
-  const emr = businessDb('DS_EMR');
-  const rows = emr.prepare('SELECT * FROM emr_record ORDER BY record_id').all()
+  const emr = await businessDb('DS_EMR');
+  const rows = (await emr.prepare('SELECT * FROM emr_record ORDER BY record_id').all())
     .filter(r => !keyword || r.patient_name.includes(keyword) || r.inhos_no.includes(keyword) || (r.diag_main || '').includes(keyword));
-  const out = rows.map(r => {
-    const last = platform.prepare('SELECT * FROM qc_result WHERE record_id=? ORDER BY id DESC LIMIT 1').get(r.record_id);
+  const out = await Promise.all(rows.map(async r => {
+    const last = await platform.prepare('SELECT * FROM qc_result WHERE record_id=? ORDER BY id DESC LIMIT 1').get(r.record_id);
     return { ...maskPatientRow(r), qcStatus: last ? (last.pass_flag ? '通过' : '不通过') : (r.qc_status || '未质控') };
-  });
+  }));
   res.json(ok(out));
 });
 C.post('/qc/check/:recordId', async (req, res) => {
-  const emr = businessDb('DS_EMR');
-  const record = emr.prepare('SELECT * FROM emr_record WHERE record_id=?').get(req.params.recordId);
+  const emr = await businessDb('DS_EMR');
+  const record = await emr.prepare('SELECT * FROM emr_record WHERE record_id=?').get(req.params.recordId);
   if (!record) throw new BizException('病案不存在');
-  const findings = qcCheckRecord(record);
+  const findings = await qcCheckRecord(record);
   const pass = findings.length === 0;
   const trace = { ontologyVersion: currentTag(), rules: findings.map(f => f.ruleCode), axioms: findings.map(f => f.axiom).filter(Boolean), concepts: ['EMR_RECORD', 'DIAGNOSIS', 'LAB_REPORT'] };
   const llm = await chat('QC_REVIEW', '你是病案质控专家。基于质控发现输出：总体结论、风险解读、整改建议。300字以内。',
     `病案：${record.record_id}（${maskName(record.patient_name)}）主诊断 ${record.diag_main}\n质控发现：${findings.map(f => `[${f.ruleCode}] ${f.evidence}`).join('；') || '无（全部规则通过）'}`);
-  platform.prepare('INSERT INTO qc_result(record_id,inhos_no,record_type,pass_flag,findings_json,trace_json,llm_used,llm_summary) VALUES (?,?,?,?,?,?,?,?)')
+  await platform.prepare('INSERT INTO qc_result(record_id,inhos_no,record_type,pass_flag,findings_json,trace_json,llm_used,llm_summary) VALUES (?,?,?,?,?,?,?,?)')
     .run(record.record_id, record.inhos_no, record.record_type, pass ? 1 : 0, JSON.stringify(findings), JSON.stringify(trace), llm ? 1 : 0, llm || null);
-  emr.prepare('UPDATE emr_record SET qc_status=? WHERE record_id=?').run(pass ? '通过' : '不通过', record.record_id);
+  await emr.prepare('UPDATE emr_record SET qc_status=? WHERE record_id=?').run(pass ? '通过' : '不通过', record.record_id);
   res.json(ok({ recordId: record.record_id, pass, findings, trace, llmSummary: llm || (pass ? '病案内涵质控通过，全部规则无命中。' : `共 ${findings.length} 项质控发现，详见清单。`), llmUsed: !!llm }));
 });
 C.post('/qc/check-all', async (req, res) => {
-  const emr = businessDb('DS_EMR');
-  const records = emr.prepare('SELECT * FROM emr_record ORDER BY record_id').all();
+  const emr = await businessDb('DS_EMR');
+  const records = await emr.prepare('SELECT * FROM emr_record ORDER BY record_id').all();
   let passCnt = 0;
   for (const record of records) {
-    const findings = qcCheckRecord(record);
+    const findings = await qcCheckRecord(record);
     const pass = findings.length === 0;
     if (pass) passCnt++;
     const trace = { ontologyVersion: currentTag(), rules: findings.map(f => f.ruleCode), axioms: findings.map(f => f.axiom).filter(Boolean), concepts: ['EMR_RECORD'] };
-    platform.prepare('INSERT INTO qc_result(record_id,inhos_no,record_type,pass_flag,findings_json,trace_json,llm_used,llm_summary) VALUES (?,?,?,?,?,?,0,?)')
+    await platform.prepare('INSERT INTO qc_result(record_id,inhos_no,record_type,pass_flag,findings_json,trace_json,llm_used,llm_summary) VALUES (?,?,?,?,?,?,0,?)')
       .run(record.record_id, record.inhos_no, record.record_type, pass ? 1 : 0, JSON.stringify(findings), JSON.stringify(trace), pass ? '通过' : `${findings.length} 项发现（规则模板）`);
-    emr.prepare('UPDATE emr_record SET qc_status=? WHERE record_id=?').run(pass ? '通过' : '不通过', record.record_id);
+    await emr.prepare('UPDATE emr_record SET qc_status=? WHERE record_id=?').run(pass ? '通过' : '不通过', record.record_id);
   }
   res.json(ok({ total: records.length, pass: passCnt, fail: records.length - passCnt }));
 });
-C.get('/qc/result/:recordId', (req, res) => {
-  const r = platform.prepare('SELECT * FROM qc_result WHERE record_id=? ORDER BY id DESC LIMIT 1').get(req.params.recordId);
+C.get('/qc/result/:recordId', async (req, res) => {
+  const r = await platform.prepare('SELECT * FROM qc_result WHERE record_id=? ORDER BY id DESC LIMIT 1').get(req.params.recordId);
   res.json(ok(r || null));
 });
 
 // ==================== 危重症预警 ====================
-C.post('/alert/detect', (req, res) => {
-  const lis = businessDb('DS_LIS');
-  const abnormal = lis.prepare(`SELECT r.report_id, r.apply_id, a.patient_no, a.item_name, r.report_time
+C.post('/alert/detect', async (req, res) => {
+  const lis = await businessDb('DS_LIS');
+  const abnormal = await lis.prepare(`SELECT r.report_id, r.apply_id, a.patient_no, a.item_name, r.report_time
     FROM lab_report r JOIN lab_apply a ON a.apply_id=r.apply_id WHERE r.result_status='A'`).all();
   let created = 0, disposed = 0;
   for (const r of abnormal) {
     const refNo = `ALERT-LR${String(r.report_time || '').replace(/[-: ]/g, '').slice(0, 14)}`;
-    const exist = platform.prepare('SELECT * FROM link_node WHERE ref_no=?').get(refNo);
-    const closed = platform.prepare("SELECT COUNT(*) c FROM link_rel WHERE to_ref_no=? AND rel_type='CLOSED_BY'").get(refNo).c;
+    const exist = await platform.prepare('SELECT * FROM link_node WHERE ref_no=?').get(refNo);
+    const closed = (await platform.prepare("SELECT COUNT(*) c FROM link_rel WHERE to_ref_no=? AND rel_type='CLOSED_BY'").get(refNo)).c;
     if (closed) disposed++;
     if (exist) continue;
-    const his = businessDb('DS_HIS');
-    const pat = his.prepare('SELECT patient_name, dept FROM inpatient WHERE inhos_no=?').get(r.patient_no);
-    platform.prepare('INSERT INTO link_node(node_type,ref_no,title,concept_code,status,occurred_at,payload) VALUES (?,?,?,?,?,?,?)')
+    const his = await businessDb('DS_HIS');
+    const pat = await his.prepare('SELECT patient_name, dept FROM inpatient WHERE inhos_no=?').get(r.patient_no);
+    await platform.prepare('INSERT INTO link_node(node_type,ref_no,title,concept_code,status,occurred_at,payload) VALUES (?,?,?,?,?,?,?)')
       .run('ALERT', refNo, `危急值：${r.item_name} 异常（${pat ? maskName(pat.patient_name) : r.patient_no}）`, 'LAB_REPORT', closed ? '已闭环' : '待处置', r.report_time,
         JSON.stringify({ inhos_no: r.patient_no, patient: pat ? maskName(pat.patient_name) : '', item: r.item_name, rule: 'RULE-QC-003', axiom: 'AX-004' }));
     if (!closed) {
       // 已有处置则闭环
-      const dis = platform.prepare("SELECT ref_no FROM link_node WHERE node_type='DISPOSAL' AND title LIKE ?").get(`%${r.patient_no}%`);
-      if (dis) platform.prepare('INSERT OR IGNORE INTO link_rel(from_ref_no,to_ref_no,rel_type,remark) VALUES (?,?,?,?)').run(refNo, dis.ref_no, 'CLOSED_BY', '处置关联');
+      const dis = await platform.prepare("SELECT ref_no FROM link_node WHERE node_type='DISPOSAL' AND title LIKE ?").get(`%${r.patient_no}%`);
+      if (dis) await platform.prepare('INSERT INTO link_rel(from_ref_no,to_ref_no,rel_type,remark) VALUES (?,?,?,?) ON CONFLICT DO NOTHING').run(refNo, dis.ref_no, 'CLOSED_BY', '处置关联');
       else created++;
     }
   }
@@ -337,16 +357,19 @@ C.post('/alert/detect', (req, res) => {
 });
 
 // ==================== RDF ABox 导出（脱敏） + SHACL 校验 ====================
-C.get('/rdf/patient/:inhosNo', (req, res) => {
+C.get('/rdf/patient/:inhosNo', async (req, res) => {
   const mask = req.query.mask !== 'false';
-  const ttl = exportPatientTurtle(req.params.inhosNo, mask);
+  const ttl = await exportPatientTurtle(req.params.inhosNo, mask);
   res.setHeader('Content-Type', 'text/turtle;charset=UTF-8');
   res.setHeader('Content-Disposition', `attachment; filename="${req.params.inhosNo}.ttl"`);
   res.send(ttl);
 });
-export function exportPatientTurtle(inhosNo, mask = true) {
-  const his = businessDb('DS_HIS'), emr = businessDb('DS_EMR'), lis = businessDb('DS_LIS'), ph = businessDb('DS_PHARMACY');
-  const p = his.prepare('SELECT * FROM inpatient WHERE inhos_no=?').get(inhosNo);
+export async function exportPatientTurtle(inhosNo, mask = true) {
+  const his = await businessDb('DS_HIS');
+  const emr = await businessDb('DS_EMR');
+  const lis = await businessDb('DS_LIS');
+  const ph = await businessDb('DS_PHARMACY');
+  const p = await his.prepare('SELECT * FROM inpatient WHERE inhos_no=?').get(inhosNo);
   if (!p) throw new BizException('住院号不存在');
   const name = mask ? maskName(p.patient_name) : p.patient_name;
   const L = [];
@@ -356,27 +379,27 @@ export function exportPatientTurtle(inhosNo, mask = true) {
   L.push(`med:Patient_${inhosNo} a med:Patient ;`);
   L.push(`    med:sex "${p.sex}" ;`);
   L.push(`    med:age ${Number(p.age)} ;`);
-  const allergies = emr.prepare('SELECT * FROM patient_allergy WHERE inhos_no=?').all(inhosNo);
+  const allergies = await emr.prepare('SELECT * FROM patient_allergy WHERE inhos_no=?').all(inhosNo);
   for (const a of allergies) L.push(`    med:hasAllergyTo med:Allergen_${encodeURIComponent(a.allergen)} ;`);
   L.push(`    med:hasEncounter med:Encounter_${inhosNo} .\n`);
   L.push(`med:Encounter_${inhosNo} a med:InpEncounter, med:Encounter ;`);
   L.push(`    med:admitTime "${p.admit_time}"^^xsd:dateTime ;`);
   L.push(`    med:status "${p.status}" .\n`);
   for (const a of allergies) L.push(`med:Allergen_${encodeURIComponent(a.allergen)} a med:Allergen ; med:allergenName "${a.allergen}" .\n`);
-  const orders = his.prepare('SELECT * FROM medical_order WHERE inhos_no=?').all(inhosNo);
-  const drugs = businessDb('DS_PHARMACY');
+  const orders = await his.prepare('SELECT * FROM medical_order WHERE inhos_no=?').all(inhosNo);
+  const drugs = await businessDb('DS_PHARMACY');
   for (const o of orders) {
     if (o.order_type === '检验') {
-      const apply = lis.prepare('SELECT * FROM lab_apply WHERE order_id=?').get(o.order_id);
+      const apply = await lis.prepare('SELECT * FROM lab_apply WHERE order_id=?').get(o.order_id);
       if (apply) {
-        const rep = lis.prepare('SELECT * FROM lab_report WHERE apply_id=?').get(apply.apply_id);
+        const rep = await lis.prepare('SELECT * FROM lab_report WHERE apply_id=?').get(apply.apply_id);
         L.push(`med:LabOrder_${o.order_id} a med:LabOrder ; med:orderStatus "${o.order_status}" .`);
         if (rep) L.push(`med:LabResult_${rep.report_id} a med:LabResult ; med:isAbnormal ${rep.result_status === 'A' ? 'true' : 'false'} ; med:ofOrder med:LabOrder_${o.order_id} .\n`);
       }
     } else if (o.order_type === '药品') {
-      const drug = drugs.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(o.item_code);
-      const disp = drugs.prepare('SELECT * FROM dispense_record WHERE order_id=?').get(o.order_id);
-      const review = drugs.prepare('SELECT * FROM presc_review WHERE order_id=?').get(o.order_id);
+      const drug = await drugs.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(o.item_code);
+      const disp = await drugs.prepare('SELECT * FROM dispense_record WHERE order_id=?').get(o.order_id);
+      const review = await drugs.prepare('SELECT * FROM presc_review WHERE order_id=?').get(o.order_id);
       L.push(`med:DrugOrder_${o.order_id} a med:DrugOrder ;`);
       L.push(`    med:prescribesDrug med:Drug_${o.item_code} ;`);
       L.push(`    med:prescribedBy med:Doctor_${encodeURIComponent(o.doctor)} ;`);
@@ -395,33 +418,35 @@ export function exportPatientTurtle(inhosNo, mask = true) {
       L.push(`med:ExamOrder_${o.order_id} a med:ExamOrder ; med:orderStatus "${o.order_status}" .\n`);
     }
   }
-  const diags = emr.prepare('SELECT * FROM emr_record WHERE inhos_no=?').all(inhosNo);
+  const diags = await emr.prepare('SELECT * FROM emr_record WHERE inhos_no=?').all(inhosNo);
   for (const r of diags) {
     for (const d of String(r.diag_list || r.diag_main || '').split(',')) {
-      const dd = emr.prepare('SELECT * FROM diag_dict WHERE diag_code=?').get(d);
+      const dd = await emr.prepare('SELECT * FROM diag_dict WHERE diag_code=?').get(d);
       if (dd) L.push(`med:Diagnosis_${d}_${inhosNo} a med:Diagnosis ; med:diagName "${dd.diag_name}" ; med:icd10Code "${dd.icd10 || ''}" ; med:snomedCode "${dd.snomed_code || ''}" .`);
     }
   }
   return L.join('\n') + '\n';
 }
-C.post('/rdf/validate/:inhosNo', (req, res) => {
+C.post('/rdf/validate/:inhosNo', async (req, res) => {
   const inhosNo = req.params.inhosNo;
-  const violations = shaclValidatePatient(inhosNo);
+  const violations = await shaclValidatePatient(inhosNo);
   res.json(ok({
     patientId: inhosNo, conforms: violations.length === 0, violations,
     violationCount: violations.length, shapes: '6 Shapes', engine: 'BeModel 内置 SHACL 语义校验（复现版）',
   }));
 });
-function shaclValidatePatient(inhosNo) {
+async function shaclValidatePatient(inhosNo) {
   const V = [];
-  const his = businessDb('DS_HIS'), emr = businessDb('DS_EMR'), ph = businessDb('DS_PHARMACY');
-  const p = his.prepare('SELECT * FROM inpatient WHERE inhos_no=?').get(inhosNo);
+  const his = await businessDb('DS_HIS');
+  const emr = await businessDb('DS_EMR');
+  const ph = await businessDb('DS_PHARMACY');
+  const p = await his.prepare('SELECT * FROM inpatient WHERE inhos_no=?').get(inhosNo);
   if (!p) return [{ focusNode: 'Patient', path: 'exists', message: '患者不存在', severity: 'Violation' }];
-  const allergies = emr.prepare('SELECT allergen FROM patient_allergy WHERE inhos_no=?').all(inhosNo).map(r => r.allergen);
-  const orders = his.prepare("SELECT * FROM medical_order WHERE inhos_no=?").all(inhosNo);
+  const allergies = (await emr.prepare('SELECT allergen FROM patient_allergy WHERE inhos_no=?').all(inhosNo)).map(r => r.allergen);
+  const orders = await his.prepare("SELECT * FROM medical_order WHERE inhos_no=?").all(inhosNo);
   // Shape1 AllergyConstraint
   for (const o of orders.filter(o => o.order_type === '药品' && o.order_status !== '2')) {
-    const drug = ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(o.item_code);
+    const drug = await ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(o.item_code);
     if (drug?.allergen && allergies.includes(drug.allergen)) {
       V.push({ focusNode: `DrugOrder_${o.order_id}`, path: 'prescribesDrug', message: `患者过敏原「${drug.allergen}」与药品「${drug.drug_name}」冲突（AllergyConstraint）`, severity: 'Violation' });
     }
@@ -429,7 +454,7 @@ function shaclValidatePatient(inhosNo) {
   // Shape2 DoseLimit
   const freqFactor = { bid: 2, tid: 3, q8h: 3 };
   for (const o of orders.filter(o => o.order_type === '药品' && o.single_dose != null)) {
-    const drug = ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(o.item_code);
+    const drug = await ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(o.item_code);
     if (!drug || drug.max_daily_dose == null) continue;
     const daily = Number(o.single_dose) * (freqFactor[o.frequency] || 1);
     if (daily > Number(drug.max_daily_dose)) {
@@ -438,17 +463,17 @@ function shaclValidatePatient(inhosNo) {
   }
   // Shape3 ChildForbidden
   for (const o of orders.filter(o => o.order_type === '药品')) {
-    const drug = ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(o.item_code);
+    const drug = await ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(o.item_code);
     if (drug?.child_forbidden === 'Y' && Number(p.age) < 14) {
       V.push({ focusNode: `DrugOrder_${o.order_id}`, path: 'prescribesDrug', message: `未成年患者（${p.age}岁）禁用「${drug.drug_name}」（ChildForbiddenShape）`, severity: 'Violation' });
     }
   }
   // Shape4 SexDisjointDiag
-  const records = emr.prepare('SELECT * FROM emr_record WHERE inhos_no=?').all(inhosNo);
+  const records = await emr.prepare('SELECT * FROM emr_record WHERE inhos_no=?').all(inhosNo);
   if (p.sex === '男') {
     for (const r of records) {
       for (const d of String(r.diag_list || '').split(',')) {
-        const dd = emr.prepare('SELECT icd10, diag_name FROM diag_dict WHERE diag_code=?').get(d);
+        const dd = await emr.prepare('SELECT icd10, diag_name FROM diag_dict WHERE diag_code=?').get(d);
         if (dd && (String(dd.icd10 || '').startsWith('O') || String(dd.icd10 || '').startsWith('N83'))) {
           V.push({ focusNode: `Diagnosis_${d}`, path: 'diagName', message: `男性患者出现诊断「${dd.diag_name}」（ICD-10 ${dd.icd10}），违反 AX-003（SexDisjointDiagShape）`, severity: 'Violation' });
         }
@@ -459,8 +484,8 @@ function shaclValidatePatient(inhosNo) {
   const drugOrders = orders.filter(o => o.order_type === '药品' && o.order_status !== '2');
   for (let i = 0; i < drugOrders.length; i++) {
     for (let j = i + 1; j < drugOrders.length; j++) {
-      const d1 = ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(drugOrders[i].item_code);
-      const d2 = ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(drugOrders[j].item_code);
+      const d1 = await ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(drugOrders[i].item_code);
+      const d2 = await ph.prepare('SELECT * FROM drug_dict WHERE drug_code=?').get(drugOrders[j].item_code);
       if (d1?.interacts_with && d1.interacts_with.split(',').includes(d2?.drug_code)) {
         V.push({ focusNode: `DrugOrder_${drugOrders[i].order_id}`, path: 'prescribesDrug', message: `「${d1.drug_name}」与「${d2.drug_name}」存在相互作用（InteractionShape）`, severity: 'Violation' });
       }
@@ -468,7 +493,7 @@ function shaclValidatePatient(inhosNo) {
   }
   // Shape6 Prescription 审方
   for (const o of drugOrders) {
-    const review = ph.prepare('SELECT * FROM presc_review WHERE order_id=?').get(o.order_id);
+    const review = await ph.prepare('SELECT * FROM presc_review WHERE order_id=?').get(o.order_id);
     if (!review || !review.pharmacist) {
       V.push({ focusNode: `Prescription_${o.order_id}`, path: 'reviewedBy', message: `药品医嘱缺少药师审核（PrescriptionShape minCount 1）`, severity: 'Violation' });
     }

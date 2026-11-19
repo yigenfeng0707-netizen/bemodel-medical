@@ -1,5 +1,6 @@
 import { platform, now, businessDb } from '../db.js';
 import { encryptSecret } from '../common.js';
+import { config } from '../config.js';
 
 // =====================================================================
 // 平台种子数据（对应原版 V1/V3~V25/V34/V37/V41/V43 种子迁移 + DataSeeder 本体部分）
@@ -279,16 +280,16 @@ const GOV_RULES = [
 
 // 数据源：[dsCode, dsName, product, fileKey]
 const DATASOURCES = [
-  ['DS_HIS', '住院HIS', 'HIS 住院医生站', 'demo_his.db'],
-  ['DS_LIS', '检验系统', 'LIS', 'demo_lis.db'],
-  ['DS_CHARGE', '收费结算', 'HIS 收费', 'demo_charge.db'],
-  ['DS_PHARMACY', '药房系统', '药房调配', 'demo_pharmacy.db'],
-  ['DS_OPD', '门诊系统', '门诊医生站', 'demo_opd.db'],
-  ['DS_EMR', '电子病历', 'EMR', 'demo_emr.db'],
-  ['DS_PACS', '影像系统', 'PACS/RIS', 'demo_pacs.db'],
-  ['DS_NURSE', '护士站', '移动护理', 'demo_nurse.db'],
-  ['DS_MATERIAL', '物资耗材', 'SPD 物资', 'demo_material.db'],
-  ['DS_LAB', '实验沙盒', 'AI 对比实验室沙盒', 'bemodel_lab.db'],
+  ['DS_HIS', '住院HIS', 'HIS 住院医生站', 'bemodel_his'],
+  ['DS_LIS', '检验系统', 'LIS', 'bemodel_lis'],
+  ['DS_CHARGE', '收费结算', 'HIS 收费', 'bemodel_charge'],
+  ['DS_PHARMACY', '药房系统', '药房调配', 'bemodel_pharmacy'],
+  ['DS_OPD', '门诊系统', '门诊医生站', 'bemodel_opd'],
+  ['DS_EMR', '电子病历', 'EMR', 'bemodel_emr'],
+  ['DS_PACS', '影像系统', 'PACS/RIS', 'bemodel_pacs'],
+  ['DS_NURSE', '护士站', '移动护理', 'bemodel_nurse'],
+  ['DS_MATERIAL', '物资耗材', 'SPD 物资', 'bemodel_material'],
+  ['DS_LAB', '实验沙盒', 'AI 对比实验室沙盒', 'bemodel_lab'],
 ];
 
 // 映射：[ds, table, column, concept, attr, valueMap]
@@ -482,114 +483,106 @@ const DOCS = [
   },
 ];
 
-export function seedPlatformData() {
-  // 幂等：以最末尾的对账组为标志（种子全部成功才会写入）
-  const done = platform.prepare("SELECT 1 FROM bm_reconcile_group WHERE group_code='DISCHARGE_CLOSE'").get();
-  if (done) return false;
+export async function seedPlatformData(force = false) {
+  // 幂等：以最末尾的对账组为标志（种子全部成功才会写入）；force=true 强制清空重播
+  if (!force) {
+    const done = await platform.prepare("SELECT 1 FROM bm_reconcile_group WHERE group_code='DISCHARGE_CLOSE'").get();
+    if (done) return false;
+  }
 
-  platform.exec('BEGIN');
+  await platform.exec('BEGIN');
   try {
-    seedAll();
-    platform.exec('COMMIT');
+    await seedAll();
+    await platform.exec('COMMIT');
     return true;
   } catch (e) {
-    try { platform.exec('ROLLBACK'); } catch { /* ignore */ }
+    try { await platform.exec('ROLLBACK'); } catch { /* ignore */ }
     throw e;
   }
 }
 
-function seedAll() {
-  platform.prepare('DELETE FROM bm_domain').run();
-  platform.prepare('DELETE FROM bm_concept').run();
-  platform.prepare('DELETE FROM bm_attribute').run();
-  platform.prepare('DELETE FROM bm_relation').run();
-  platform.prepare('DELETE FROM bm_concept_parent').run();
-  platform.prepare('DELETE FROM bm_concept_disjoint').run();
-  platform.prepare('DELETE FROM bm_axiom').run();
-  platform.prepare('DELETE FROM bm_term').run();
-  platform.prepare('DELETE FROM bm_metric').run();
-  platform.prepare('DELETE FROM bm_rule').run();
-  platform.prepare('DELETE FROM bm_action').run();
-  platform.prepare('DELETE FROM bm_gov_rule').run();
-  platform.prepare('DELETE FROM bm_datasource').run();
-  platform.prepare('DELETE FROM bm_mapping').run();
-  platform.prepare('DELETE FROM bm_knowledge').run();
-  platform.prepare('DELETE FROM link_node').run();
-  platform.prepare('DELETE FROM link_rel').run();
-  platform.prepare('DELETE FROM bm_document').run();
-  platform.prepare('DELETE FROM bm_doc_chunk').run();
-  platform.prepare('DELETE FROM bm_reconcile_group').run();
+async function seedAll() {
+  // 动态清空平台库全部业务表（排除 bm_user——seedUsers 在外层管理，开发态先于本函数执行）。
+  // 生产首次启动为空库时是空操作；测试重复运行时清掉上次残留的运行时数据（发布/工单/对账/质控等）。
+  const tbls = (await platform.prepare("SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> 'bm_user'").all())
+    .map(r => `"${r.tablename}"`);
+  if (tbls.length) await platform.prepare(`TRUNCATE TABLE ${tbls.join(',')} CASCADE`).run();
 
   const insDomain = platform.prepare('INSERT INTO bm_domain(code,name,description,sort) VALUES (?,?,?,?)');
-  for (const d of DOMAINS) insDomain.run(...d);
+  for (const d of DOMAINS) await insDomain.run(...d);
 
   const insConcept = platform.prepare('INSERT INTO bm_concept(code,name,domain_code,definition,owner,status,version) VALUES (?,?,?,?,?,?,1)');
   const insAttr = platform.prepare('INSERT INTO bm_attribute(concept_code,attr_code,attr_name,data_type,is_key,definition,sort) VALUES (?,?,?,?,?,?,?)');
   for (const [code, name, domain, def, owner, attrs] of CONCEPTS) {
-    insConcept.run(code, name, domain, def, owner, 'PUBLISHED');
-    attrs.forEach((a, i) => insAttr.run(code, a[0], a[1], a[2], a[3] ? 1 : 0, a[4] || '', i));
+    await insConcept.run(code, name, domain, def, owner, 'PUBLISHED');
+    for (let i = 0; i < attrs.length; i++) {
+      const a = attrs[i];
+      await insAttr.run(code, a[0], a[1], a[2], a[3] ? 1 : 0, a[4] || '', i);
+    }
   }
 
   const insRel = platform.prepare(`INSERT INTO bm_relation(from_concept,to_concept,relation_name,description,is_symmetric,is_transitive,is_functional,is_inverse_functional,is_asymmetric,inverse_of)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
   for (const [f, t, n, d, ax, inv] of RELATIONS) {
-    insRel.run(f, t, n, d || '', ax.sym ? 1 : 0, ax.trans ? 1 : 0, ax.func ? 1 : 0, ax.invFunc ? 1 : 0, ax.asym ? 1 : 0, inv);
+    await insRel.run(f, t, n, d || '', ax.sym ? 1 : 0, ax.trans ? 1 : 0, ax.func ? 1 : 0, ax.invFunc ? 1 : 0, ax.asym ? 1 : 0, inv);
   }
 
   const insParent = platform.prepare('INSERT INTO bm_concept_parent(child_code,parent_code,is_primary) VALUES (?,?,?)');
-  for (const p of PARENTS) insParent.run(...p);
+  for (const p of PARENTS) await insParent.run(...p);
 
   const insDis = platform.prepare('INSERT INTO bm_concept_disjoint(concept_a_code,concept_b_code,definition) VALUES (?,?,?)');
-  for (const d of DISJOINTS) insDis.run(...d);
+  for (const d of DISJOINTS) await insDis.run(...d);
 
   const insAxiom = platform.prepare('INSERT INTO bm_axiom(axiom_code,subject,predicate,object,axiom_type,description) VALUES (?,?,?,?,?,?)');
-  for (const a of AXIOMS) insAxiom.run(...a);
+  // AXIOMS 种子元组为 5 元（无 axiom_type），PG 严格绑定要求参数数一致——取 predicate 充当公理类型
+  for (const [code, subj, pred, obj, desc] of AXIOMS) await insAxiom.run(code, subj, pred, obj, pred, desc);
 
   const insTerm = platform.prepare('INSERT INTO bm_term(term,concept_code,source_product,term_type,code_system,standard_code) VALUES (?,?,?,?,?,?)');
-  for (const t of TERMS) insTerm.run(...t);
+  for (const t of TERMS) await insTerm.run(...t);
 
   const insMetric = platform.prepare(`INSERT INTO bm_metric(metric_code,name,definition,formula,concept_code,owner,ds_code,probe_sql,warn_threshold)
     VALUES (?,?,?,?,?,?,?,?,?)`);
-  for (const m of METRICS) insMetric.run(...m);
+  for (const m of METRICS) await insMetric.run(...m);
 
   const insRule = platform.prepare(`INSERT INTO bm_rule(rule_code,name,concept_code,rule_type,expression,metric_code,severity,owner,status,version,engine,expr_json)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
   for (const r of RULES) {
     const [code, name, concept, type, expr, metric, sev, owner, engine, exprJson] = r;
-    insRule.run(code, name, concept, type, expr, metric, sev, owner, 'PUBLISHED', 1, engine || null, exprJson || null);
+    await insRule.run(code, name, concept, type, expr, metric, sev, owner, 'PUBLISHED', 1, engine || null, exprJson || null);
   }
 
   const insAction = platform.prepare(`INSERT INTO bm_action(action_code,name,concept_code,from_status,to_status,trigger_desc,description,status,version)
     VALUES (?,?,?,?,?,?,?,?,1)`);
-  for (const a of ACTIONS) insAction.run(...a, 'PUBLISHED');
+  for (const a of ACTIONS) await insAction.run(...a, 'PUBLISHED');
 
   const insGov = platform.prepare('INSERT INTO bm_gov_rule(rule_code,rule_name,rule_type,concept_code,severity,expr_json,status) VALUES (?,?,?,?,?,?,?)');
-  for (const g of GOV_RULES) insGov.run(g[0], g[1], g[2], g[3], g[4], JSON.stringify(g[5]), 'PUBLISHED');
+  for (const g of GOV_RULES) await insGov.run(g[0], g[1], g[2], g[3], g[4], JSON.stringify(g[5]), 'PUBLISHED');
 
   const insDs = platform.prepare('INSERT INTO bm_datasource(ds_code,ds_name,product_name,db_type,host,port,db_name,username,password) VALUES (?,?,?,?,?,?,?,?,?)');
-  for (const [code, name, product, file] of DATASOURCES) {
-    insDs.run(code, name, product, 'SQLITE', '127.0.0.1', 0, file, 'demo', encryptSecret('demo'));
+  for (const [code, name, product, dbname] of DATASOURCES) {
+    await insDs.run(code, name, product, 'POSTGRESQL', config.pg.host, config.pg.port, dbname, 'demo', encryptSecret('demo'));
   }
 
   const insMap = platform.prepare(`INSERT INTO bm_mapping(ds_code,table_name,column_name,concept_code,attr_code,value_map,confirmed,source,status,updated_by,updated_at)
     VALUES (?,?,?,?,?,?,1,'MANUAL','ACTIVE','system',?)`);
-  for (const m of MAPPINGS) insMap.run(m[0], m[1], m[2], m[3], m[4], m[5], now());
+  for (const m of MAPPINGS) await insMap.run(m[0], m[1], m[2], m[3], m[4], m[5], now());
 
   const insKnow = platform.prepare(`INSERT INTO bm_knowledge(code,title,content,applies_to,concept_code,source,status,version,owner)
     VALUES (?,?,?,?,?, 'SEED','PUBLISHED',1,?)`);
-  for (const k of KNOWLEDGE) insKnow.run(k[0], k[1], k[2], k[3], null, k[3].split(',')[0] === 'DISPENSE' ? '客服组 周颖' : '信息科');
+  for (const k of KNOWLEDGE) await insKnow.run(k[0], k[1], k[2], k[3], null, k[3].split(',')[0] === 'DISPENSE' ? '客服组 周颖' : '信息科');
 
   const insNode = platform.prepare('INSERT INTO link_node(node_type,ref_no,title,concept_code,status,occurred_at,payload) VALUES (?,?,?,?,?,?,?)');
-  for (const nd of LINK_NODES) insNode.run(...nd);
+  for (const nd of LINK_NODES) await insNode.run(...nd);
   const insRelL = platform.prepare('INSERT INTO link_rel(from_ref_no,to_ref_no,rel_type,remark) VALUES (?,?,?,?)');
-  for (const r of LINK_RELS) insRelL.run(...r);
+  for (const r of LINK_RELS) await insRelL.run(...r);
 
   // 种子文档（已发布）+ 切片
   const insDoc = platform.prepare('INSERT INTO bm_document(title,doc_type,source,status,version,owner,uploaded_by,file_size,content_hash,content_text) VALUES (?,?,?,?,?,?,?,?,?,?)');
   const insChunk = platform.prepare('INSERT INTO bm_doc_chunk(document_id,seq,heading,content) VALUES (?,?,?,?)');
+  const insFts = platform.prepare('INSERT INTO bm_doc_chunk_fts(chunk_id,content) VALUES (?,?)');
   for (const doc of DOCS) {
     const hash = doc.title; // 种子以标题为指纹即可
-    const r = insDoc.run(doc.title, doc.docType, 'SEED', 'PUBLISHED', 1, doc.owner, 'system', doc.content.length, hash, doc.content);
+    const r = await insDoc.run(doc.title, doc.docType, 'SEED', 'PUBLISHED', 1, doc.owner, 'system', doc.content.length, hash, doc.content);
     const docId = r.lastInsertRowid;
     let seq = 0, heading = '';
     for (const para of doc.content.split(/\n\n+/)) {
@@ -597,15 +590,15 @@ function seedAll() {
       if (h) heading = h[1];
       const text = para.replace(/^#+\s+.*$/m, '').trim();
       if (!text) continue;
-      insChunk.run(docId, seq++, heading, text.slice(0, 500));
-      platform.prepare('INSERT INTO bm_doc_chunk_fts(content) VALUES (?)').run(text.slice(0, 500));
+      const c = await insChunk.run(docId, seq++, heading, text.slice(0, 500));
+      await insFts.run(c.lastInsertRowid, text.slice(0, 500));
     }
   }
 
   // 对账组（出院人数：HIS 口径 vs 结算口径，预置归因桶）
   const insGroup = platform.prepare(`INSERT INTO bm_reconcile_group(group_code,name,definition,metric_codes,drill_ds_code,drill_sql,owner,dispute_status,buckets_json,scheduled)
     VALUES (?,?,?,?,?,?,?,?,?,1)`);
-  insGroup.run(
+  await insGroup.run(
     'DISCHARGE_CLOSE', '出院人数：HIS×结算对账',
     'HIS 出院人数与收费结算单笔数存在口径差，用归因桶拆解差异来源。',
     'DISCHARGE_COUNT,SETTLE_COUNT', 'DS_HIS',
@@ -616,25 +609,32 @@ function seedAll() {
       { label: '取消未结算（裂缝）', dsCode: 'DS_HIS', sign: -1, sql: "SELECT COUNT(DISTINCT o.inhos_no) FROM medical_order o JOIN fee_detail f ON f.order_id=o.order_id WHERE o.order_status='2' AND f.fee_status='1'" },
     ]));
 
-  seedPhysicalSnapshots();
+  await seedPhysicalSnapshots();
   return true;
 }
 
 // 物理快照：对九个演示库做一次真实扫描（等价 information_schema 扫描落 bm_physical_*）
-export function seedPhysicalSnapshots() {
+export async function seedPhysicalSnapshots() {
   const delT = platform.prepare('DELETE FROM bm_physical_table WHERE ds_code=?');
   const delC = platform.prepare('DELETE FROM bm_physical_column WHERE ds_code=?');
   const insT = platform.prepare('INSERT INTO bm_physical_table(ds_code,table_name,table_comment,scanned_at) VALUES (?,?,?,?)');
   const insC = platform.prepare('INSERT INTO bm_physical_column(ds_code,table_name,column_name,data_type,column_comment,is_pk,ordinal_position) VALUES (?,?,?,?,?,?,?)');
   const st = now();
-  for (const [dsCode, , , file] of DATASOURCES) {
-    let db; try { db = businessDb(dsCode); } catch { continue; }
-    delT.run(dsCode); delC.run(dsCode);
-    const tables = db.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
+  for (const [dsCode, , , dbname] of DATASOURCES) {
+    let db; try { db = await businessDb(dsCode); } catch { continue; }
+    await delT.run(dsCode); await delC.run(dsCode);
+    // PG：用 information_schema.tables / columns 取物理元数据
+    const tables = await db.prepare("SELECT table_name AS name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name").all();
     for (const t of tables) {
-      insT.run(dsCode, t.name, '', st);
-      const cols = db.prepare(`PRAGMA table_info(${t.name})`).all();
-      cols.forEach((c, i) => insC.run(dsCode, t.name, c.name, c.type || 'TEXT', '', c.pk ? 1 : 0, i + 1));
+      await insT.run(dsCode, t.name, '', st);
+      const cols = await db.prepare(`SELECT column_name AS name, data_type AS type, ordinal_position AS pos FROM information_schema.columns WHERE table_schema='public' AND table_name=? ORDER BY ordinal_position`).all(t.name);
+      // 主键列标记
+      const pkRes = await db.prepare("SELECT column_name FROM information_schema.key_column_usage WHERE table_schema='public' AND table_name=? AND constraint_name LIKE '%_pkey'").all(t.name);
+      const pkSet = new Set(pkRes.map(r => r.column_name));
+      for (let i = 0; i < cols.length; i++) {
+        const c = cols[i];
+        await insC.run(dsCode, t.name, c.name, c.type || 'TEXT', '', pkSet.has(c.name) ? 1 : 0, c.pos);
+      }
     }
   }
 }
